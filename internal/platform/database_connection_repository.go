@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -63,8 +64,10 @@ func (databaseConnectionRecord) String() string         { return "[record koneks
 func (databaseConnectionRecord) GoString() string       { return "[record koneksi disembunyikan]" }
 
 type DatabaseConnectionRepository struct {
-	db        *sql.DB
-	passwords *DatabasePasswordCipher
+	db          *sql.DB
+	passwords   *DatabasePasswordCipher
+	poolMu      sync.RWMutex
+	targetPools *TargetConnectionManager
 }
 
 func NewDatabaseConnectionRepository(db *sql.DB, passwords *DatabasePasswordCipher) *DatabaseConnectionRepository {
@@ -183,8 +186,13 @@ func (r *DatabaseConnectionRepository) Update(ctx context.Context, id int, param
 		WHERE id = $9 RETURNING ` + databaseConnectionColumns + `;`
 	connection, err := scanDatabaseConnection(r.db.QueryRowContext(ctx, query, params.Name, params.Host,
 		params.Port, params.DatabaseName, params.Username, params.SSLMode, params.SSLRootCert, ciphertext, id))
+	// Invalidasi tetap dijalankan saat hasil query gagal diterima karena perubahan mungkin sudah tersimpan di server.
+	invalidationErr := r.invalidateTargetPool(id)
 	if err != nil {
-		return DatabaseConnection{}, databaseConnectionRepositoryError("gagal memperbarui konfigurasi", err)
+		return DatabaseConnection{}, errors.Join(databaseConnectionRepositoryError("gagal memperbarui konfigurasi", err), invalidationErr)
+	}
+	if invalidationErr != nil {
+		return DatabaseConnection{}, invalidationErr
 	}
 	return connection, nil
 }
@@ -195,17 +203,46 @@ func (r *DatabaseConnectionRepository) Delete(ctx context.Context, id int) error
 		return ErrInvalidDatabaseConnection
 	}
 	result, err := r.db.ExecContext(ctx, `DELETE FROM platform.database_connections WHERE id = $1;`, id)
+	invalidationErr := r.invalidateTargetPool(id)
 	if err != nil {
-		return databaseConnectionRepositoryError("gagal menghapus konfigurasi", err)
+		return errors.Join(databaseConnectionRepositoryError("gagal menghapus konfigurasi", err), invalidationErr)
 	}
 	count, err := result.RowsAffected()
 	if err != nil {
-		return databaseConnectionRepositoryError("gagal memeriksa penghapusan konfigurasi", err)
+		return errors.Join(databaseConnectionRepositoryError("gagal memeriksa penghapusan konfigurasi", err), invalidationErr)
 	}
 	if count == 0 {
-		return ErrDatabaseConnectionNotFound
+		return errors.Join(ErrDatabaseConnectionNotFound, invalidationErr)
 	}
+	return invalidationErr
+}
+
+func (r *DatabaseConnectionRepository) attachTargetPools(manager *TargetConnectionManager) error {
+	r.poolMu.Lock()
+	defer r.poolMu.Unlock()
+	if r.targetPools != nil {
+		return ErrTargetManagerAlreadyAttached
+	}
+	r.targetPools = manager
 	return nil
+}
+
+func (r *DatabaseConnectionRepository) detachTargetPools(manager *TargetConnectionManager) {
+	r.poolMu.Lock()
+	defer r.poolMu.Unlock()
+	if r.targetPools == manager {
+		r.targetPools = nil
+	}
+}
+
+func (r *DatabaseConnectionRepository) invalidateTargetPool(databaseID int) error {
+	r.poolMu.RLock()
+	manager := r.targetPools
+	r.poolMu.RUnlock()
+	if manager == nil {
+		return nil
+	}
+	return manager.Invalidate(databaseID)
 }
 
 func scanDatabaseConnection(row interface{ Scan(...any) error }) (DatabaseConnection, error) {
