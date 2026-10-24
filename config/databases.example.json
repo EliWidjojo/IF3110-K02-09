@@ -1,0 +1,20 @@
+[
+  {
+    "id": "postgres-demo",
+    "name": "PostgreSQL Demo",
+    "driver": "postgres",
+    "dsn": "postgres://platform:local-target-password@127.0.0.1:55432/platform_target?sslmode=disable"
+  },
+  {
+    "id": "mysql-demo",
+    "name": "MySQL Demo",
+    "driver": "mysql",
+    "dsn": "platform:local-target-password@tcp(127.0.0.1:53306)/platform_target"
+  },
+  {
+    "id": "mariadb-demo",
+    "name": "MariaDB Demo",
+    "driver": "mariadb",
+    "dsn": "platform:local-target-password@tcp(127.0.0.1:53307)/platform_target"
+  }
+]
