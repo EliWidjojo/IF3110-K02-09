@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	ErrDatabaseConnectionNameTaken = errors.New("nama konfigurasi database sudah dipakai")
-	ErrDatabaseConnectionStorage   = errors.New("penyimpanan konfigurasi database gagal")
-	ErrInvalidDatabaseConnection   = errors.New("konfigurasi database tidak valid")
+	ErrDatabaseConnectionNameTaken  = errors.New("nama konfigurasi database sudah dipakai")
+	ErrDatabaseConnectionStorage    = errors.New("penyimpanan konfigurasi database gagal")
+	ErrInvalidDatabaseConnection    = errors.New("konfigurasi database tidak valid")
+	ErrDatabaseConnectionReferenced = errors.New("konfigurasi database masih dirujuk data lain")
 )
 
 type CreateDatabaseConnectionParams struct {
@@ -74,20 +75,13 @@ func NewDatabaseConnectionRepository(db *sql.DB, passwords *DatabasePasswordCiph
 	return &DatabaseConnectionRepository{db: db, passwords: passwords}
 }
 
-const databaseConnectionColumns = `id, name, host, port, database_name, username, ssl_mode, ssl_root_cert`
+const databaseConnectionColumns = `id, name, host, port, database_name, username, ssl_mode, ssl_root_cert,
+	COALESCE(octet_length(encrypted_credentials), 0) > 0 AS password_configured`
 
 func (r *DatabaseConnectionRepository) Create(ctx context.Context, params CreateDatabaseConnectionParams) (DatabaseConnection, error) {
-	if params.Port == 0 {
-		params.Port = 5432
-	}
-	if params.SSLMode == "" {
-		params.SSLMode = "require"
-	}
-	if !validConnectionText(params.Name) || !validConnectionHost(params.Host) ||
-		!validConnectionText(params.DatabaseName) || !validConnectionText(params.Username) ||
-		params.Port < 1 || params.Port > 65535 || !validConnectionSSLMode(params.SSLMode) ||
-		!validOptionalConnectionText(params.SSLRootCert) || strings.ContainsRune(params.Password, '\x00') {
-		return DatabaseConnection{}, ErrInvalidDatabaseConnection
+	params, err := normalizedDatabaseConnectionCreate(params)
+	if err != nil {
+		return DatabaseConnection{}, err
 	}
 	if err := r.passwords.requireKey(); err != nil {
 		return DatabaseConnection{}, err
@@ -136,6 +130,34 @@ func (r *DatabaseConnectionRepository) GetByID(ctx context.Context, id int) (Dat
 	return connection, nil
 }
 
+// List mengambil metadata dan indikator password saja agar daftar admin tidak memuat kredensial terenkripsi maupun plaintext.
+func (r *DatabaseConnectionRepository) List(ctx context.Context, limit, offset int) ([]DatabaseConnection, error) {
+	if limit < 0 || limit > 100 || offset < 0 {
+		return nil, ErrInvalidDatabaseConnection
+	}
+	if limit == 0 {
+		limit = 20
+	}
+	query := `SELECT ` + databaseConnectionColumns + ` FROM platform.database_connections ORDER BY id ASC LIMIT $1 OFFSET $2;`
+	rows, err := r.db.QueryContext(ctx, query, limit, offset)
+	if err != nil {
+		return nil, databaseConnectionRepositoryError("gagal mengambil daftar konfigurasi", err)
+	}
+	defer rows.Close()
+	connections := make([]DatabaseConnection, 0)
+	for rows.Next() {
+		connection, err := scanDatabaseConnection(rows)
+		if err != nil {
+			return nil, databaseConnectionRepositoryError("gagal membaca daftar konfigurasi", err)
+		}
+		connections = append(connections, connection)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, databaseConnectionRepositoryError("gagal menyelesaikan daftar konfigurasi", err)
+	}
+	return connections, nil
+}
+
 // LoadCredentials tidak menggantikan pemeriksaan izin dan hanya boleh dipakai backend setelah otorisasi database target.
 func (r *DatabaseConnectionRepository) LoadCredentials(ctx context.Context, id int) (DatabaseConnectionCredentials, error) {
 	if id <= 0 {
@@ -149,7 +171,8 @@ func (r *DatabaseConnectionRepository) LoadCredentials(ctx context.Context, id i
 	var username sql.NullString
 	err := r.db.QueryRowContext(ctx, query, id).Scan(&record.configuration.ID, &record.configuration.Name,
 		&record.configuration.Host, &record.configuration.Port, &record.configuration.DatabaseName,
-		&username, &record.configuration.SSLMode, &record.configuration.SSLRootCert, &record.ciphertext)
+		&username, &record.configuration.SSLMode, &record.configuration.SSLRootCert,
+		&record.configuration.PasswordConfigured, &record.ciphertext)
 	if err != nil {
 		return DatabaseConnectionCredentials{}, databaseConnectionRepositoryError("gagal mengambil kredensial koneksi", err)
 	}
@@ -177,6 +200,20 @@ func (r *DatabaseConnectionRepository) Update(ctx context.Context, id int, param
 		}
 		ciphertext = encrypted
 	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DatabaseConnection{}, databaseConnectionRepositoryError("gagal memulai pembaruan konfigurasi", err)
+	}
+	defer tx.Rollback()
+	current, err := scanDatabaseConnection(tx.QueryRowContext(ctx,
+		`SELECT `+databaseConnectionColumns+` FROM platform.database_connections WHERE id = $1 FOR UPDATE;`, id))
+	if err != nil {
+		return DatabaseConnection{}, databaseConnectionRepositoryError("gagal mengambil konfigurasi untuk pembaruan", err)
+	}
+	// Validasi gabungan dilakukan dengan kunci baris agar patch TLS bersamaan tidak menghasilkan kombinasi yang tidak valid.
+	if !validDatabaseConnectionConfiguration(mergedDatabaseConnection(current, params)) {
+		return DatabaseConnection{}, ErrInvalidDatabaseConnection
+	}
 	query := `
 		UPDATE platform.database_connections SET
 			name = COALESCE($1, name), host = COALESCE($2, host), port = COALESCE($3, port),
@@ -184,12 +221,16 @@ func (r *DatabaseConnectionRepository) Update(ctx context.Context, id int, param
 			ssl_mode = COALESCE($6, ssl_mode), ssl_root_cert = COALESCE($7, ssl_root_cert),
 			encrypted_credentials = COALESCE($8, encrypted_credentials)
 		WHERE id = $9 RETURNING ` + databaseConnectionColumns + `;`
-	connection, err := scanDatabaseConnection(r.db.QueryRowContext(ctx, query, params.Name, params.Host,
+	connection, err := scanDatabaseConnection(tx.QueryRowContext(ctx, query, params.Name, params.Host,
 		params.Port, params.DatabaseName, params.Username, params.SSLMode, params.SSLRootCert, ciphertext, id))
-	// Invalidasi tetap dijalankan saat hasil query gagal diterima karena perubahan mungkin sudah tersimpan di server.
-	invalidationErr := r.invalidateTargetPool(id)
 	if err != nil {
-		return DatabaseConnection{}, errors.Join(databaseConnectionRepositoryError("gagal memperbarui konfigurasi", err), invalidationErr)
+		return DatabaseConnection{}, databaseConnectionRepositoryError("gagal memperbarui konfigurasi", err)
+	}
+	commitErr := tx.Commit()
+	// Pool diinvalidasi setelah kunci transaksi dilepas, termasuk saat hasil commit tidak dapat dipastikan.
+	invalidationErr := r.invalidateTargetPool(id)
+	if commitErr != nil {
+		return DatabaseConnection{}, errors.Join(databaseConnectionRepositoryError("gagal menyimpan pembaruan konfigurasi", commitErr), invalidationErr)
 	}
 	if invalidationErr != nil {
 		return DatabaseConnection{}, invalidationErr
@@ -249,7 +290,7 @@ func scanDatabaseConnection(row interface{ Scan(...any) error }) (DatabaseConnec
 	var connection DatabaseConnection
 	var username sql.NullString
 	err := row.Scan(&connection.ID, &connection.Name, &connection.Host, &connection.Port,
-		&connection.DatabaseName, &username, &connection.SSLMode, &connection.SSLRootCert)
+		&connection.DatabaseName, &username, &connection.SSLMode, &connection.SSLRootCert, &connection.PasswordConfigured)
 	connection.Username = username.String
 	return connection, err
 }
@@ -269,6 +310,51 @@ func validDatabaseConnectionUpdate(params UpdateDatabaseConnectionParams) bool {
 		(params.SSLMode == nil || validConnectionSSLMode(*params.SSLMode)) &&
 		(params.SSLRootCert == nil || validOptionalConnectionText(*params.SSLRootCert)) &&
 		(params.Password == nil || !strings.ContainsRune(*params.Password, '\x00'))
+}
+
+func normalizedDatabaseConnectionCreate(params CreateDatabaseConnectionParams) (CreateDatabaseConnectionParams, error) {
+	if params.Port == 0 {
+		params.Port = 5432
+	}
+	if params.SSLMode == "" {
+		params.SSLMode = "require"
+	}
+	configuration := DatabaseConnection{
+		Name: params.Name, Host: params.Host, Port: params.Port, DatabaseName: params.DatabaseName,
+		Username: params.Username, SSLMode: params.SSLMode, SSLRootCert: params.SSLRootCert,
+	}
+	if !validDatabaseConnectionConfiguration(configuration) || strings.ContainsRune(params.Password, '\x00') {
+		return CreateDatabaseConnectionParams{}, ErrInvalidDatabaseConnection
+	}
+	return params, nil
+}
+
+func mergedDatabaseConnection(configuration DatabaseConnection, params UpdateDatabaseConnectionParams) DatabaseConnection {
+	for _, attribute := range []struct {
+		input  *string
+		stored *string
+	}{
+		{params.Name, &configuration.Name}, {params.Host, &configuration.Host},
+		{params.DatabaseName, &configuration.DatabaseName}, {params.Username, &configuration.Username},
+		{params.SSLMode, &configuration.SSLMode}, {params.SSLRootCert, &configuration.SSLRootCert},
+	} {
+		if attribute.input != nil {
+			*attribute.stored = *attribute.input
+		}
+	}
+	if params.Port != nil {
+		configuration.Port = *params.Port
+	}
+	return configuration
+}
+
+// Validasi gabungan menjaga pengaturan CA sistem tetap memakai verifikasi hostname penuh.
+func validDatabaseConnectionConfiguration(configuration DatabaseConnection) bool {
+	return validConnectionText(configuration.Name) && validConnectionHost(configuration.Host) &&
+		configuration.Port >= 1 && configuration.Port <= 65535 &&
+		validConnectionText(configuration.DatabaseName) && validConnectionText(configuration.Username) &&
+		validConnectionSSLMode(configuration.SSLMode) && validOptionalConnectionText(configuration.SSLRootCert) &&
+		(configuration.SSLRootCert != "system" || configuration.SSLMode == "verify-full")
 }
 
 func validConnectionText(value string) bool {
@@ -301,6 +387,9 @@ func databaseConnectionRepositoryError(operation string, err error) error {
 	var pgErr *pq.Error
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.Constraint == "database_connections_name_key" {
 		return fmt.Errorf("%s: %w", operation, ErrDatabaseConnectionNameTaken)
+	}
+	if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+		return fmt.Errorf("%s: %w", operation, ErrDatabaseConnectionReferenced)
 	}
 	if errors.Is(err, context.Canceled) {
 		return fmt.Errorf("%s: %w: %w", operation, ErrDatabaseConnectionStorage, context.Canceled)

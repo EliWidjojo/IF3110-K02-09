@@ -31,6 +31,8 @@ type DatabaseConnection struct {
 	Username     string `json:"username"`
 	SSLMode      string `json:"ssl_mode"`
 	SSLRootCert  string `json:"ssl_root_cert"`
+	// PasswordConfigured hanya menunjukkan keberadaan password terenkripsi, termasuk password kosong yang dikonfigurasi eksplisit.
+	PasswordConfigured bool `json:"password_configured"`
 }
 
 // AccessLevel menyatakan izin pada database tertentu dan terpisah dari peran Platform Admin.
