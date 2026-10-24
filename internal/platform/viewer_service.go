@@ -54,6 +54,52 @@ func (s *ViewerService) ListTables(ctx context.Context, databaseID int, schema s
 	return s.metadata.ListTables(ctx, db, schema)
 }
 
+func (s *ViewerService) ReadTableData(ctx context.Context, databaseID int, schema, table string, pagination ViewerPagination) (ViewerTableData, error) {
+	if databaseID <= 0 || !validViewerIdentifier(schema) || !validViewerIdentifier(table) {
+		return ViewerTableData{}, ErrInvalidViewerInput
+	}
+	pagination, err := normalizedViewerPagination(pagination)
+	if err != nil {
+		return ViewerTableData{}, err
+	}
+	if s == nil {
+		return ViewerTableData{}, ErrViewerDependencyUnavailable
+	}
+	reader, ok := s.metadata.(ViewerTableDataStore)
+	if !ok {
+		return ViewerTableData{}, ErrViewerDependencyUnavailable
+	}
+	ctx, cancel := context.WithTimeout(ctx, viewerOperationTimeout)
+	defer cancel()
+	// Pemeriksaan akses efektif tetap mendahului pembukaan pool dan seluruh pembacaan metadata maupun data target.
+	db, err := s.readableDatabase(ctx, databaseID)
+	if err != nil {
+		return ViewerTableData{}, err
+	}
+	return reader.ReadTableData(ctx, db, schema, table, pagination)
+}
+
+func (s *ViewerService) GetTableMetadata(ctx context.Context, databaseID int, schema, table string) (ViewerTableMetadata, error) {
+	if databaseID <= 0 || !validViewerIdentifier(schema) || !validViewerIdentifier(table) {
+		return ViewerTableMetadata{}, ErrInvalidViewerInput
+	}
+	if s == nil {
+		return ViewerTableMetadata{}, ErrViewerDependencyUnavailable
+	}
+	reader, ok := s.metadata.(ViewerTableMetadataStore)
+	if !ok {
+		return ViewerTableMetadata{}, ErrViewerDependencyUnavailable
+	}
+	ctx, cancel := context.WithTimeout(ctx, viewerOperationTimeout)
+	defer cancel()
+	// Jalur akses yang sama memeriksa identitas dan izin terkini sebelum koneksi atau query metadata digunakan.
+	db, err := s.readableDatabase(ctx, databaseID)
+	if err != nil {
+		return ViewerTableMetadata{}, err
+	}
+	return reader.GetTableMetadata(ctx, db, schema, table)
+}
+
 func (s *ViewerService) readableDatabase(ctx context.Context, databaseID int) (*sql.DB, error) {
 	if s == nil || s.access == nil {
 		return nil, ErrViewerDependencyUnavailable

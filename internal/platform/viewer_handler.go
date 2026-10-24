@@ -20,6 +20,8 @@ func RegisterViewerRoutes(mux *http.ServeMux, handler *ViewerHandler) {
 	mux.HandleFunc("/api/viewer/databases", handler.HandleDatabases)
 	mux.HandleFunc("/api/viewer/databases/{database_id}/schemas", handler.HandleSchemas)
 	mux.HandleFunc("/api/viewer/databases/{database_id}/schemas/{schema}/tables", handler.HandleTables)
+	mux.HandleFunc("/api/viewer/databases/{database_id}/schemas/{schema}/tables/{table}", handler.HandleTableMetadata)
+	mux.HandleFunc("/api/viewer/databases/{database_id}/schemas/{schema}/tables/{table}/data", handler.HandleTableData)
 }
 
 func (h *ViewerHandler) HandleDatabases(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +101,9 @@ func writeViewerError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrDatabaseAccessDenied), errors.Is(err, ErrInactiveUser):
 		status, apiError = http.StatusForbidden, &userAPIError{Code: "database_access_denied", Message: "akses database ditolak"}
 	case errors.Is(err, ErrInvalidViewerInput), errors.Is(err, ErrInvalidAccessInput), errors.Is(err, ErrInvalidDatabaseConnection):
-		status, apiError = http.StatusBadRequest, &userAPIError{Code: "invalid_input", Message: "ID database atau nama schema tidak valid"}
+		status, apiError = http.StatusBadRequest, &userAPIError{Code: "invalid_input", Message: "ID database, nama schema, nama tabel, atau pagination tidak valid"}
+	case errors.Is(err, ErrViewerTableNotFound):
+		status, apiError = http.StatusNotFound, &userAPIError{Code: "table_not_found", Message: "tabel tidak ditemukan atau tidak ditampilkan"}
 	case errors.Is(err, ErrViewerSchemaNotFound):
 		status, apiError = http.StatusNotFound, &userAPIError{Code: "schema_not_found", Message: "schema tidak ditemukan atau tidak ditampilkan"}
 	case errors.Is(err, ErrDatabaseConnectionNotFound):
@@ -116,6 +120,8 @@ func writeViewerError(w http.ResponseWriter, err error) {
 		status, apiError = http.StatusBadGateway, &userAPIError{Code: "metadata_query_failed", Message: "metadata database target tidak dapat dibaca"}
 	case errors.Is(err, ErrTargetConnectionFailed):
 		status, apiError = http.StatusBadGateway, &userAPIError{Code: "target_connection_failed", Message: "koneksi ke database target gagal"}
+	case errors.Is(err, ErrViewerTableData):
+		apiError = &userAPIError{Code: "table_data_failed", Message: "data tabel tidak dapat disajikan"}
 	}
 	writeUserJSON(w, status, nil, apiError)
 }
