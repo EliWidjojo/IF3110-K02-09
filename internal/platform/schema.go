@@ -34,11 +34,18 @@ CREATE TABLE IF NOT EXISTS platform.database_connections (
 	host TEXT NOT NULL CHECK (btrim(host) <> ''),
 	port INT NOT NULL DEFAULT 5432 CHECK (port BETWEEN 1 AND 65535),
 	database_name TEXT NOT NULL CHECK (btrim(database_name) <> ''),
+	username TEXT NOT NULL CHECK (btrim(username) <> ''),
 	ssl_mode TEXT NOT NULL DEFAULT 'require'
 		CHECK (ssl_mode IN ('disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full')),
-	-- Blob kredensial harus sudah dienkripsi oleh aplikasi sebelum disimpan ke database internal.
+	ssl_root_cert TEXT NOT NULL DEFAULT '',
+	-- Kolom ini menyimpan envelope password terenkripsi, sedangkan username disimpan pada kolom terpisah.
 	encrypted_credentials BYTEA NOT NULL CHECK (octet_length(encrypted_credentials) > 0)
 );
+
+-- Username konfigurasi lama dibiarkan NULL sampai dilengkapi tanpa menebak atau menimpa kredensial yang sudah ada.
+ALTER TABLE platform.database_connections
+	ADD COLUMN IF NOT EXISTS username TEXT CHECK (btrim(username) <> ''),
+	ADD COLUMN IF NOT EXISTS ssl_root_cert TEXT NOT NULL DEFAULT '';
 
 -- Penghapusan group atau konfigurasi database mencabut akses terkait tanpa menghapus entitas di sisi lain.
 CREATE TABLE IF NOT EXISTS platform.group_database_access (

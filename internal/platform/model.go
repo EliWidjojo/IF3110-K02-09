@@ -21,16 +21,16 @@ type GroupMembership struct {
 	GroupID int `json:"group_id"`
 }
 
-// DatabaseConnection menyimpan konfigurasi PostgreSQL target tanpa membuka koneksi ke database tersebut.
+// DatabaseConnection merupakan representasi publik konfigurasi PostgreSQL tanpa password atau ciphertext.
 type DatabaseConnection struct {
 	ID           int    `json:"id"`
 	Name         string `json:"name"`
 	Host         string `json:"host"`
 	Port         int    `json:"port"`
 	DatabaseName string `json:"database_name"`
+	Username     string `json:"username"`
 	SSLMode      string `json:"ssl_mode"`
-	// EncryptedCredentials menampung username dan password terenkripsi beserta metadata dekripsinya, tanpa menyimpan kunci enkripsi.
-	EncryptedCredentials []byte `json:"-"`
+	SSLRootCert  string `json:"ssl_root_cert"`
 }
 
 // AccessLevel menyatakan izin pada database tertentu dan terpisah dari peran Platform Admin.
