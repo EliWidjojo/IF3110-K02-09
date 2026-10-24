@@ -60,6 +60,11 @@ func NewUserService(store UserStore, identity VerifiedUserProvider, hasher UserP
 	return &UserService{store: store, identity: identity, hasher: hasher, sessions: sessions}
 }
 
+// RequirePlatformAdmin menyediakan pemeriksaan identitas dan peran yang sama untuk service administrasi lain.
+func (s *UserService) RequirePlatformAdmin(ctx context.Context) error {
+	return s.requireAdmin(ctx)
+}
+
 func (s *UserService) requireAdmin(ctx context.Context) error {
 	if s == nil || s.store == nil || s.identity == nil {
 		return ErrUserDependencyUnavailable
