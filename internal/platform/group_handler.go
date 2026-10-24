@@ -21,6 +21,8 @@ func NewGroupHandler(service *GroupService, csrf UserCSRFVerifier) *GroupHandler
 func RegisterGroupRoutes(mux *http.ServeMux, handler *GroupHandler) {
 	mux.HandleFunc("/api/admin/groups", handler.HandleGroups)
 	mux.HandleFunc("/api/admin/groups/{id}", handler.HandleGroup)
+	mux.HandleFunc("/api/admin/groups/{id}/members", handler.HandleGroupMembers)
+	mux.HandleFunc("/api/admin/groups/{id}/members/{user_id}", handler.HandleGroupMember)
 }
 
 func (h *GroupHandler) HandleGroups(w http.ResponseWriter, r *http.Request) {
@@ -161,7 +163,15 @@ func writeGroupServiceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrInvalidGroupInput):
 		writeUserJSON(w, http.StatusBadRequest, nil, &userAPIError{
-			Code: "invalid_input", Message: "nama group atau pagination tidak valid",
+			Code: "invalid_input", Message: "data group, user anggota, atau pagination tidak valid",
+		})
+	case errors.Is(err, ErrGroupMembershipExists):
+		writeUserJSON(w, http.StatusConflict, nil, &userAPIError{
+			Code: "group_membership_exists", Message: "user sudah menjadi anggota group",
+		})
+	case errors.Is(err, ErrGroupMembershipNotFound):
+		writeUserJSON(w, http.StatusNotFound, nil, &userAPIError{
+			Code: "group_membership_not_found", Message: "keanggotaan group tidak ditemukan",
 		})
 	case errors.Is(err, ErrGroupNotFound):
 		writeUserJSON(w, http.StatusNotFound, nil, &userAPIError{

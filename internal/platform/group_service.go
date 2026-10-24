@@ -21,6 +21,9 @@ type GroupStore interface {
 	List(context.Context, int, int) ([]Group, error)
 	Update(context.Context, int, UpdateGroupParams) (Group, error)
 	Delete(context.Context, int) error
+	AddMember(context.Context, int, int) (GroupMembership, error)
+	RemoveMember(context.Context, int, int) error
+	ListMembers(context.Context, int, int, int) ([]User, error)
 }
 
 type GroupService struct {
@@ -91,6 +94,36 @@ func (s *GroupService) Delete(ctx context.Context, id int) error {
 		return ErrInvalidGroupInput
 	}
 	return s.store.Delete(ctx, id)
+}
+
+func (s *GroupService) AddMember(ctx context.Context, groupID, userID int) (GroupMembership, error) {
+	if err := s.requireAdmin(ctx); err != nil {
+		return GroupMembership{}, err
+	}
+	if groupID <= 0 || userID <= 0 {
+		return GroupMembership{}, ErrInvalidGroupInput
+	}
+	return s.store.AddMember(ctx, groupID, userID)
+}
+
+func (s *GroupService) RemoveMember(ctx context.Context, groupID, userID int) error {
+	if err := s.requireAdmin(ctx); err != nil {
+		return err
+	}
+	if groupID <= 0 || userID <= 0 {
+		return ErrInvalidGroupInput
+	}
+	return s.store.RemoveMember(ctx, groupID, userID)
+}
+
+func (s *GroupService) ListMembers(ctx context.Context, groupID, limit, offset int) ([]User, error) {
+	if err := s.requireAdmin(ctx); err != nil {
+		return nil, err
+	}
+	if groupID <= 0 || limit < 0 || limit > 100 || offset < 0 {
+		return nil, ErrInvalidGroupInput
+	}
+	return s.store.ListMembers(ctx, groupID, limit, offset)
 }
 
 // Nama group dibatasi 128 karakter tanpa spasi tepi atau karakter kontrol agar identitas group mudah dibedakan.
