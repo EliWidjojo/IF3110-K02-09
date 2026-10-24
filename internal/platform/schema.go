@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS platform.users (
 	is_platform_admin BOOLEAN NOT NULL DEFAULT FALSE
 );
 
+-- User lama dapat belum memiliki hash; modul authentication harus menolak login sampai kredensial tersedia.
+ALTER TABLE platform.users
+	ADD COLUMN IF NOT EXISTS password_hash TEXT CHECK (btrim(password_hash) <> '');
+
 CREATE TABLE IF NOT EXISTS platform.groups (
 	id SERIAL PRIMARY KEY,
 	name TEXT NOT NULL UNIQUE CHECK (btrim(name) <> '')
