@@ -23,6 +23,8 @@ func RegisterGroupRoutes(mux *http.ServeMux, handler *GroupHandler) {
 	mux.HandleFunc("/api/admin/groups/{id}", handler.HandleGroup)
 	mux.HandleFunc("/api/admin/groups/{id}/members", handler.HandleGroupMembers)
 	mux.HandleFunc("/api/admin/groups/{id}/members/{user_id}", handler.HandleGroupMember)
+	mux.HandleFunc("/api/admin/groups/{id}/database-access", handler.HandleGroupDatabaseAccessList)
+	mux.HandleFunc("/api/admin/groups/{id}/database-access/{database_id}", handler.HandleGroupDatabaseAccess)
 }
 
 func (h *GroupHandler) HandleGroups(w http.ResponseWriter, r *http.Request) {
@@ -163,7 +165,19 @@ func writeGroupServiceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrInvalidGroupInput):
 		writeUserJSON(w, http.StatusBadRequest, nil, &userAPIError{
-			Code: "invalid_input", Message: "data group, user anggota, atau pagination tidak valid",
+			Code: "invalid_input", Message: "data group, user anggota, database, atau pagination tidak valid",
+		})
+	case errors.Is(err, ErrInvalidAccessLevel):
+		writeUserJSON(w, http.StatusBadRequest, nil, &userAPIError{
+			Code: "invalid_access_level", Message: "tingkat akses harus View Only atau View + Edit",
+		})
+	case errors.Is(err, ErrDatabaseConnectionNotFound):
+		writeUserJSON(w, http.StatusNotFound, nil, &userAPIError{
+			Code: "database_connection_not_found", Message: "konfigurasi database target tidak ditemukan",
+		})
+	case errors.Is(err, ErrGroupDatabaseAccessNotFound):
+		writeUserJSON(w, http.StatusNotFound, nil, &userAPIError{
+			Code: "group_database_access_not_found", Message: "akses group terhadap database tidak ditemukan",
 		})
 	case errors.Is(err, ErrGroupMembershipExists):
 		writeUserJSON(w, http.StatusConflict, nil, &userAPIError{

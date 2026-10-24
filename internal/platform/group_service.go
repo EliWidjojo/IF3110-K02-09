@@ -24,6 +24,10 @@ type GroupStore interface {
 	AddMember(context.Context, int, int) (GroupMembership, error)
 	RemoveMember(context.Context, int, int) error
 	ListMembers(context.Context, int, int, int) ([]User, error)
+	SetDatabaseAccess(context.Context, int, int, AccessLevel) (GroupDatabaseAccess, error)
+	GetDatabaseAccess(context.Context, int, int) (GroupDatabaseAccess, error)
+	ListDatabaseAccess(context.Context, int, int, int) ([]GroupDatabaseAccess, error)
+	RevokeDatabaseAccess(context.Context, int, int) error
 }
 
 type GroupService struct {

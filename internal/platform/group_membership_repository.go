@@ -91,7 +91,7 @@ func (r *GroupRepository) ListMembers(ctx context.Context, groupID, limit, offse
 	}
 	defer tx.Rollback()
 
-	if err := lockMembershipGroup(ctx, tx, groupID); err != nil {
+	if err := lockGroupForRelation(ctx, tx, groupID); err != nil {
 		return nil, err
 	}
 	query := `
@@ -130,7 +130,7 @@ func (r *GroupRepository) ListMembers(ctx context.Context, groupID, limit, offse
 
 // Kunci pada baris induk mencegah penghapusan user atau group di antara pemeriksaan keberadaan dan perubahan keanggotaan.
 func lockMembershipParents(ctx context.Context, tx *sql.Tx, groupID, userID int) error {
-	if err := lockMembershipGroup(ctx, tx, groupID); err != nil {
+	if err := lockGroupForRelation(ctx, tx, groupID); err != nil {
 		return err
 	}
 	var id int
@@ -144,12 +144,12 @@ func lockMembershipParents(ctx context.Context, tx *sql.Tx, groupID, userID int)
 	return nil
 }
 
-// Kunci group juga membedakan group tidak ditemukan dari daftar anggota kosong secara konsisten selama transaksi.
-func lockMembershipGroup(ctx context.Context, tx *sql.Tx, groupID int) error {
+// Kunci group menjaga keberadaan induk selama transaksi keanggotaan maupun pemberian akses database.
+func lockGroupForRelation(ctx context.Context, tx *sql.Tx, groupID int) error {
 	var id int
 	err := tx.QueryRowContext(ctx, `SELECT id FROM platform.groups WHERE id = $1 FOR KEY SHARE;`, groupID).Scan(&id)
 	if err != nil {
-		return groupRepositoryError("gagal memeriksa group anggota", err)
+		return groupRepositoryError("gagal memeriksa group", err)
 	}
 	return nil
 }
