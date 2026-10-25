@@ -140,3 +140,63 @@ func (ms *MigrationService) GetMigrationHistory(userAccess string) ([]MigrationH
 	}
 	return histories, nil
 }
+
+type DesiredTable struct {
+	TableName string                      `json:"table_name"`
+	Columns   map[string]ColumnDefinition `json:"columns"`
+}
+
+func (ms *MigrationService) GenerateMigrationDiff(desiredTables []DesiredTable) (string, error) {
+	currentSchema, err := ms.InspectCurrentSchema()
+	if err != nil {
+		return "", err
+	}
+
+	var generatedSQL []string
+
+	for _, targetTable := range desiredTables {
+		currentColumns, tableExists := currentSchema[targetTable.TableName]
+
+		if !tableExists {
+			var colDefs []string
+			for colName, col := range targetTable.Columns {
+				nullableStr := ""
+				if strings.ToUpper(col.IsNullable) == "NO" {
+					nullableStr = " NOT NULL"
+				}
+				colDefs = append(colDefs, fmt.Sprintf("%s %s%s", colName, col.DataType, nullableStr))
+			}
+
+			createSQL := fmt.Sprintf("CREATE TABLE %s (\n  %s\n);", 
+				targetTable.TableName, 
+				strings.Join(colDefs, ",\n  "))
+			
+			generatedSQL = append(generatedSQL, createSQL)
+			continue
+		}
+
+		for colName, targetCol := range targetTable.Columns {
+			_, colExists := currentColumns[colName]
+			if !colExists {
+				nullableStr := ""
+				if strings.ToUpper(targetCol.IsNullable) == "NO" {
+					nullableStr = " NOT NULL"
+				}
+
+				alterSQL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s%s;",
+					targetTable.TableName,
+					colName,
+					targetCol.DataType,
+					nullableStr)
+
+				generatedSQL = append(generatedSQL, alterSQL)
+			}
+		}
+	}
+
+	if len(generatedSQL) == 0 {
+		return "-- Tidak ada perubahan schema yang terdeteksi.", nil
+	}
+
+	return strings.Join(generatedSQL, "\n\n"), nil
+}

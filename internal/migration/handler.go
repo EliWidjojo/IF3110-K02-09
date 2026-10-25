@@ -38,6 +38,31 @@ func (h *MigrationHandler) HandleExecuteMigration(w http.ResponseWriter, r *http
 	})
 }
 
+// POST /api/migrations/generate-diff
+func (h *MigrationHandler) HandleGenerateDiff(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var desiredTables []DesiredTable
+	if err := json.NewDecoder(r.Body).Decode(&desiredTables); err != nil {
+		http.Error(w, "Format JSON schema target tidak valid", http.StatusBadRequest)
+		return
+	}
+
+	candidateSQL, err := h.Service.GenerateMigrationDiff(desiredTables)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"candidate_sql": candidateSQL,
+	})
+}
+
 // GET /api/migrations/history
 func (h *MigrationHandler) HandleGetHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
