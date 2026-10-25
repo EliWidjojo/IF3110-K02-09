@@ -1,9 +1,7 @@
 package migration
 
 import (
-	"database/sql"
 	"fmt"
-	"strings"
 )
 
 type ColumnDefinition struct {
