@@ -1,9 +1,10 @@
 module IF3110-K02-09
 
-go 1.27.3
+go 1.25.0
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/lib/pq v1.12.3
 	github.com/wasilibs/go-pgquery v0.0.0-20261020014038-c50e9f18754b
 )
@@ -15,3 +16,5 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
+
+require filippo.io/edwards25519 v1.1.0 // indirect

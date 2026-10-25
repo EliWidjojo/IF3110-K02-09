@@ -70,7 +70,7 @@ func TestExecuteMigration_SQLError_Rollback(t *testing.T) {
 		UserID:     1,
 		UserAccess: "View + Edit",
 		Version:    1,
-		QuerySQL:   "QUERY SQL SALAH SYNTAX;",
+		QuerySQL:   "INSERT INTO missing_table VALUES (1);",
 	}
 
 	mock.ExpectQuery(`SELECT MAX\(version\) FROM schema_migrations WHERE status = 'SUCCESS';`).
@@ -78,7 +78,7 @@ func TestExecuteMigration_SQLError_Rollback(t *testing.T) {
 
 	mock.ExpectBegin()
 
-	mock.ExpectExec("QUERY SQL SALAH SYNTAX").
+	mock.ExpectExec("INSERT INTO missing_table").
 		WillReturnError(errors.New("syntax error at or near 'QUERY'"))
 
 	mock.ExpectRollback()

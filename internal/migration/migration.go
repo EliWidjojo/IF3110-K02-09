@@ -1,20 +1,23 @@
 package migration
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
+	"IF3110-K02-09/internal/database"
 )
 
 type MigrationRequest struct {
-	UserID      int
-	UserAccess  string // "View Only" atau "View + Edit"
-	Version     int
-	Description string
-	QuerySQL    string
+	UserID       int    `json:"-"` // Set by authenticated backend only.
+	UserAccess   string `json:"-"`
+	Version      int    `json:"version"`
+	Description  string `json:"description"`
+	QuerySQL     string `json:"query_sql"`
+	NonAtomicDDL bool   `json:"non_atomic_ddl"`
 }
 
 type MigrationHistory struct {
@@ -28,12 +31,17 @@ type MigrationHistory struct {
 
 type MigrationService struct {
 	TargetDB *sql.DB
+	Dialect  database.Dialect
+	mu       sync.Mutex
 }
 
 func NewMigrationService(db *sql.DB) *MigrationService {
-	return &MigrationService{TargetDB: db}
+	return NewMigrationServiceWithDialect(db, database.Postgres)
 }
 
+func NewMigrationServiceWithDialect(db *sql.DB, dialect database.Dialect) *MigrationService {
+	return &MigrationService{TargetDB: db, Dialect: dialect}
+}
 
 func (ms *MigrationService) InitMigrationTable() error {
 	query := `
@@ -45,6 +53,12 @@ func (ms *MigrationService) InitMigrationTable() error {
 		status VARCHAR(20) NOT NULL,
 		query_sql TEXT NOT NULL
 	);`
+	if ms.Dialect.IsMySQL() {
+		query = `CREATE TABLE IF NOT EXISTS schema_migrations (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY, version INT NOT NULL UNIQUE,
+		executed_by INT NOT NULL, executed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		status VARCHAR(20) NOT NULL, query_sql LONGTEXT NOT NULL) ENGINE=InnoDB;`
+	}
 	_, err := ms.TargetDB.Exec(query)
 	return err
 }
@@ -57,64 +71,150 @@ func (ms *MigrationService) GetLatestVersion() (int, error) {
 		return 0, err
 	}
 	if !latestVersion.Valid {
-		return 0, nil // Belum ada migrasi
+		return 0, nil
 	}
 	return int(latestVersion.Int32), nil
 }
 
 func (ms *MigrationService) ExecuteMigration(req MigrationRequest) error {
-	// Check Permission Access
+	return ms.ExecuteMigrationContext(context.Background(), req)
+}
+
+func (ms *MigrationService) ExecuteMigrationContext(ctx context.Context, req MigrationRequest) error {
+	// 1. Validasi Akses dan Input Awal
 	if req.UserAccess != "View + Edit" {
 		return errors.New("akses ditolak: hanya user dengan role 'View + Edit' yang dapat menjalankan migrasi")
 	}
 
-	// Check Linear Migration Version Order
-	latest, err := ms.GetLatestVersion()
-	if err == nil && req.Version <= latest {
-		return fmt.Errorf("versi migrasi (%d) harus lebih besar dari versi terakhir (%d)", req.Version, latest)
+	if req.UserID <= 0 || req.Version <= 0 {
+		return errors.New("invalid user or migration version")
 	}
 
-	// Begin Transaction
-	tx, err := ms.TargetDB.Begin()
+	statements, err := database.Statements(req.QuerySQL, ms.Dialect, req.NonAtomicDDL)
+	if err != nil {
+		return err
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	// 2. Validasi Versi Linear
+	var latest sql.NullInt32
+	err = ms.TargetDB.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations WHERE status = 'SUCCESS';`).Scan(&latest)
+	if err != nil {
+		return fmt.Errorf("cannot read migration version: %w", err)
+	}
+	if req.Version <= int(latest.Int32) {
+		return fmt.Errorf("versi migrasi (%d) harus lebih besar dari versi terakhir (%d)", req.Version, latest.Int32)
+	}
+
+	// 3. Eksekusi Non-Atomic DDL
+	if req.NonAtomicDDL {
+		return ms.executeNonAtomicDDL(ctx, req, statements)
+	}
+
+	// 4. Validasi Engine MySQL jika menggunakan transaksi
+	if ms.Dialect.IsMySQL() {
+		var unsupported int
+		err := ms.TargetDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' AND engine <> 'InnoDB'`).Scan(&unsupported)
+		if err != nil {
+			return errors.New("cannot verify transactional storage engines")
+		}
+		if unsupported != 0 {
+			return errors.New("transactional migrations require all target tables to use InnoDB")
+		}
+	}
+
+	// 5. Transaksi Database
+	tx, err := ms.TargetDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("gagal memulai transaksi: %w", err)
 	}
 
+	// Safe Rollback Guard
+	committed := false
 	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
 		if p := recover(); p != nil {
-			tx.Rollback()
-			panic(p)
+			panic(p) // Re-throw panic setelah rollback
 		}
 	}()
 
-	// Execute User SQL Query
-	_, err = tx.Exec(req.QuerySQL)
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("migrasi gagal di-execute, seluruh perubahan dibatalkan (rollback): %w", err)
+	for _, statement := range statements {
+		_, err = tx.ExecContext(ctx, statement)
+		if err != nil {
+			return fmt.Errorf("migrasi gagal di-execute, seluruh perubahan dibatalkan (rollback): %w", err)
+		}
 	}
 
-	// Log Success to schema_migrations inside transaction
 	logQuery := `
 		INSERT INTO schema_migrations (version, executed_by, executed_at, status, query_sql)
 		VALUES ($1, $2, $3, $4, $5);
 	`
-	_, err = tx.Exec(logQuery, req.Version, req.UserID, time.Now(), "SUCCESS", req.QuerySQL)
+	if ms.Dialect.IsMySQL() {
+		logQuery = `INSERT INTO schema_migrations (version, executed_by, executed_at, status, query_sql) VALUES (?, ?, ?, ?, ?);`
+	}
+	_, err = tx.ExecContext(ctx, logQuery, req.Version, req.UserID, time.Now(), "SUCCESS", req.QuerySQL)
 	if err != nil {
-		tx.Rollback()
 		return fmt.Errorf("gagal mencatat riwayat migrasi: %w", err)
 	}
 
-	// Commit Transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("gagal commit transaksi: %w", err)
 	}
 
-	fmt.Printf("Migrasi versi %d berhasil dijalankan dan di-commit!\n", req.Version)
+	committed = true
+	return nil
+}
+
+// Support Dialect placeholders pada Non-Atomic DDL & eksekusi multi-statements
+func (ms *MigrationService) executeNonAtomicDDL(ctx context.Context, req MigrationRequest, statements []string) error {
+	insertQuery := `INSERT INTO schema_migrations (version, executed_by, executed_at, status, query_sql) VALUES ($1, $2, $3, $4, $5);`
+	updateQuery := `UPDATE schema_migrations SET status = $1 WHERE version = $2;`
+
+	if ms.Dialect.IsMySQL() {
+		insertQuery = `INSERT INTO schema_migrations (version, executed_by, executed_at, status, query_sql) VALUES (?, ?, ?, ?, ?);`
+		updateQuery = `UPDATE schema_migrations SET status = ? WHERE version = ?;`
+	}
+
+	_, err := ms.TargetDB.ExecContext(ctx, insertQuery, req.Version, req.UserID, time.Now(), "RUNNING", req.QuerySQL)
+	if err != nil {
+		return err
+	}
+
+	var execErr error
+	for _, stmt := range statements {
+		_, execErr = ms.TargetDB.ExecContext(ctx, stmt)
+		if execErr != nil {
+			break
+		}
+	}
+
+	status := "SUCCESS"
+	if execErr != nil {
+		status = "FAILED"
+	}
+
+	logCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, logErr := ms.TargetDB.ExecContext(logCtx, updateQuery, status, req.Version)
+	if logErr != nil {
+		return errors.New("non-atomic DDL history unresolved; inspect target and RUNNING entry before retry")
+	}
+	if execErr != nil {
+		return errors.New("non-atomic DDL failed; inspect target, rollback is unavailable")
+	}
 	return nil
 }
 
 func (ms *MigrationService) GetMigrationHistory(userAccess string) ([]MigrationHistory, error) {
+	return ms.GetMigrationHistoryContext(context.Background(), userAccess)
+}
+
+func (ms *MigrationService) GetMigrationHistoryContext(ctx context.Context, userAccess string) ([]MigrationHistory, error) {
 	if userAccess != "View Only" && userAccess != "View + Edit" {
 		return nil, errors.New("akses ditolak: anda tidak memiliki izin untuk melihat riwayat migrasi")
 	}
@@ -124,13 +224,13 @@ func (ms *MigrationService) GetMigrationHistory(userAccess string) ([]MigrationH
 		FROM schema_migrations 
 		ORDER BY version ASC;
 	`
-	rows, err := ms.TargetDB.Query(query)
+	rows, err := ms.TargetDB.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("gagal mengambil riwayat migrasi: %w", err)
 	}
 	defer rows.Close()
 
-	var histories []MigrationHistory
+	histories := []MigrationHistory{}
 	for rows.Next() {
 		var h MigrationHistory
 		if err := rows.Scan(&h.ID, &h.Version, &h.ExecutedBy, &h.ExecutedAt, &h.Status, &h.QuerySQL); err != nil {
@@ -138,65 +238,5 @@ func (ms *MigrationService) GetMigrationHistory(userAccess string) ([]MigrationH
 		}
 		histories = append(histories, h)
 	}
-	return histories, nil
-}
-
-type DesiredTable struct {
-	TableName string                      `json:"table_name"`
-	Columns   map[string]ColumnDefinition `json:"columns"`
-}
-
-func (ms *MigrationService) GenerateMigrationDiff(desiredTables []DesiredTable) (string, error) {
-	currentSchema, err := ms.InspectCurrentSchema()
-	if err != nil {
-		return "", err
-	}
-
-	var generatedSQL []string
-
-	for _, targetTable := range desiredTables {
-		currentColumns, tableExists := currentSchema[targetTable.TableName]
-
-		if !tableExists {
-			var colDefs []string
-			for colName, col := range targetTable.Columns {
-				nullableStr := ""
-				if strings.ToUpper(col.IsNullable) == "NO" {
-					nullableStr = " NOT NULL"
-				}
-				colDefs = append(colDefs, fmt.Sprintf("%s %s%s", colName, col.DataType, nullableStr))
-			}
-
-			createSQL := fmt.Sprintf("CREATE TABLE %s (\n  %s\n);", 
-				targetTable.TableName, 
-				strings.Join(colDefs, ",\n  "))
-			
-			generatedSQL = append(generatedSQL, createSQL)
-			continue
-		}
-
-		for colName, targetCol := range targetTable.Columns {
-			_, colExists := currentColumns[colName]
-			if !colExists {
-				nullableStr := ""
-				if strings.ToUpper(targetCol.IsNullable) == "NO" {
-					nullableStr = " NOT NULL"
-				}
-
-				alterSQL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s%s;",
-					targetTable.TableName,
-					colName,
-					targetCol.DataType,
-					nullableStr)
-
-				generatedSQL = append(generatedSQL, alterSQL)
-			}
-		}
-	}
-
-	if len(generatedSQL) == 0 {
-		return "-- Tidak ada perubahan schema yang terdeteksi.", nil
-	}
-
-	return strings.Join(generatedSQL, "\n\n"), nil
+	return histories, rows.Err()
 }
