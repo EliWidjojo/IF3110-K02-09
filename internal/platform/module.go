@@ -5,51 +5,70 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"time"
+
+	"IF3110-K02-09/internal/access"
+	"IF3110-K02-09/internal/admin"
+	"IF3110-K02-09/internal/database"
+	"IF3110-K02-09/internal/httpapi"
+	"IF3110-K02-09/internal/queryanalysis"
+	"IF3110-K02-09/internal/viewer"
 )
 
 // SecurityDependencies wajib berasal dari modul A yang memakai identitas PostgreSQL yang sama dengan administrasi B.
 type SecurityDependencies struct {
-	Identity       VerifiedUserProvider
-	PasswordHasher UserPasswordHasher
-	Sessions       UserSessionRevoker
-	CSRF           UserCSRFVerifier
+	Identity       admin.VerifiedUserProvider
+	PasswordHasher admin.UserPasswordHasher
+	Sessions       admin.UserSessionRevoker
+	CSRF           admin.UserCSRFVerifier
 }
 
 type PlatformModule struct {
-	Pools          *TargetConnectionManager
-	Access         *EffectiveAccessService
-	Authentication *AuthenticationRepository
-	users          *UserService
-	groups         *GroupService
-	connections    *DatabaseConnectionService
-	viewer         *ViewerService
-	analysis       *QueryAnalysisService
+	Pools          *database.TargetConnectionManager
+	Access         *access.EffectiveAccessService
+	Authentication *admin.AuthenticationRepository
+	users          *admin.UserService
+	grants         *access.GrantService
+	groups         *admin.GroupService
+	connections    *database.DatabaseConnectionService
+	viewer         *viewer.ViewerService
+	analysis       *queryanalysis.QueryAnalysisService
 	security       SecurityDependencies
 }
 
 // Komposisi memakai satu repository konfigurasi agar penulisan admin dan pool target berbagi invalidasi yang sama.
-func NewPlatformModule(db *sql.DB, cipher *DatabasePasswordCipher, security SecurityDependencies) (*PlatformModule, error) {
+func NewPlatformModule(db *sql.DB, cipher *database.DatabasePasswordCipher, security SecurityDependencies) (*PlatformModule, error) {
 	if db == nil {
-		return nil, ErrViewerDependencyUnavailable
+		return nil, viewer.ErrViewerDependencyUnavailable
 	}
-	repository := NewDatabaseConnectionRepository(db, cipher)
-	pools, err := NewTargetConnectionManager(repository, TargetPoolOptions{})
+	repository := database.NewDatabaseConnectionRepository(db, cipher)
+	pools, err := database.NewTargetConnectionManager(repository, database.TargetPoolOptions{})
 	if err != nil {
 		return nil, err
 	}
-	users := NewUserService(NewUserRepository(db), security.Identity, security.PasswordHasher, security.Sessions)
-	access := NewEffectiveAccessService(NewEffectiveAccessRepository(db), security.Identity)
-	return &PlatformModule{Pools: pools, Access: access, Authentication: NewAuthenticationRepository(db), users: users,
-		groups: NewGroupService(NewGroupRepository(db), users), connections: NewDatabaseConnectionService(repository, pools, users),
-		viewer: NewViewerService(access, pools, NewViewerMetadataRepository()), analysis: NewQueryAnalysisService(access, pools), security: security}, nil
+	users := admin.NewUserService(admin.NewUserRepository(db), security.Identity, security.PasswordHasher, security.Sessions)
+	effectiveAccess := access.NewEffectiveAccessService(access.NewEffectiveAccessRepository(db), security.Identity)
+	return &PlatformModule{
+		Pools:          pools,
+		Access:         effectiveAccess,
+		Authentication: admin.NewAuthenticationRepository(db),
+		users:          users,
+		grants:         access.NewGrantService(access.NewGrantRepository(db), users),
+		groups:         admin.NewGroupService(admin.NewGroupRepository(db), users),
+		connections:    database.NewDatabaseConnectionService(repository, pools, users),
+		viewer:         viewer.NewViewerService(effectiveAccess, pools, viewer.NewViewerMetadataRepository()),
+		analysis:       queryanalysis.NewQueryAnalysisService(effectiveAccess, pools),
+		security:       security,
+	}, nil
 }
 
 func (m *PlatformModule) RegisterRoutes(mux *http.ServeMux) {
-	RegisterUserRoutes(mux, NewUserHandler(m.users, m.security.CSRF))
-	RegisterGroupRoutes(mux, NewGroupHandler(m.groups, m.security.CSRF))
-	RegisterDatabaseConnectionRoutes(mux, NewDatabaseConnectionHandler(m.connections, m.security.CSRF))
-	RegisterViewerRoutes(mux, NewViewerHandler(m.viewer))
-	RegisterQueryAnalysisRoutes(mux, NewQueryAnalysisHandler(m.analysis, m.security.CSRF))
+	admin.RegisterUserRoutes(mux, admin.NewUserHandler(m.users, m.security.CSRF))
+	admin.RegisterGroupRoutes(mux, admin.NewGroupHandler(m.groups, m.security.CSRF))
+	access.RegisterGrantRoutes(mux, access.NewGrantHandler(m.grants, m.security.CSRF))
+	database.RegisterDatabaseConnectionRoutes(mux, database.NewDatabaseConnectionHandler(m.connections, m.security.CSRF))
+	viewer.RegisterViewerRoutes(mux, viewer.NewViewerHandler(m.viewer))
+	queryanalysis.RegisterQueryAnalysisRoutes(mux, queryanalysis.NewQueryAnalysisHandler(m.analysis, m.security.CSRF))
 	mux.HandleFunc("/api/platform/me", m.handleIdentity)
 	RegisterDashboardRoutes(mux)
 }
@@ -62,50 +81,50 @@ func (m *PlatformModule) Close() error {
 
 func (m *PlatformModule) handleIdentity(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeUserMethodError(w, "GET")
+		httpapi.WriteMethodError(w, "GET")
 		return
 	}
 	if m == nil || m.security.Identity == nil {
-		writeUserServiceError(w, ErrUserDependencyUnavailable)
+		admin.WriteUserServiceError(w, admin.ErrUserDependencyUnavailable)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), viewerOperationTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	id, err := m.security.Identity.VerifiedUserID(ctx)
-	if errors.Is(err, ErrUnauthenticated) || (err == nil && id <= 0) {
-		writeUserServiceError(w, ErrUnauthenticated)
+	if errors.Is(err, admin.ErrUnauthenticated) || (err == nil && id <= 0) {
+		admin.WriteUserServiceError(w, admin.ErrUnauthenticated)
 		return
 	}
 	if err != nil {
-		writeUserServiceError(w, ErrUserDependencyUnavailable)
+		admin.WriteUserServiceError(w, admin.ErrUserDependencyUnavailable)
 		return
 	}
-	user, err := m.users.store.GetByID(ctx, id)
-	if errors.Is(err, ErrUserNotFound) || (err == nil && !user.IsActive) {
-		writeUserServiceError(w, ErrUnauthenticated)
+	user, err := m.Authentication.CurrentUser(ctx, id)
+	if errors.Is(err, admin.ErrUserNotFound) || (err == nil && !user.IsActive) {
+		admin.WriteUserServiceError(w, admin.ErrUnauthenticated)
 		return
 	}
 	if err != nil {
-		writeUserServiceError(w, err)
+		admin.WriteUserServiceError(w, err)
 		return
 	}
-	writeUserJSON(w, 200, user, nil)
+	httpapi.WriteJSON(w, 200, user, nil)
 }
 
 type VerifiedIdentityFunc func(context.Context) (int, error)
 
 func (f VerifiedIdentityFunc) VerifiedUserID(ctx context.Context) (int, error) {
 	if f == nil {
-		return 0, ErrUserDependencyUnavailable
+		return 0, admin.ErrUserDependencyUnavailable
 	}
 	return f(ctx)
 }
 
-type PasswordHasherFunc func(context.Context, string) (PasswordHash, error)
+type PasswordHasherFunc func(context.Context, string) (admin.PasswordHash, error)
 
-func (f PasswordHasherFunc) HashPassword(ctx context.Context, password string) (PasswordHash, error) {
+func (f PasswordHasherFunc) HashPassword(ctx context.Context, password string) (admin.PasswordHash, error) {
 	if f == nil {
-		return "", ErrUserDependencyUnavailable
+		return "", admin.ErrUserDependencyUnavailable
 	}
 	return f(ctx, password)
 }
@@ -114,7 +133,7 @@ type SessionRevokerFunc func(context.Context, int) error
 
 func (f SessionRevokerFunc) RevokeUserSessions(ctx context.Context, id int) error {
 	if f == nil {
-		return ErrUserDependencyUnavailable
+		return admin.ErrUserDependencyUnavailable
 	}
 	return f(ctx, id)
 }
@@ -123,7 +142,7 @@ type CSRFVerifierFunc func(*http.Request) error
 
 func (f CSRFVerifierFunc) ValidateCSRF(r *http.Request) error {
 	if f == nil {
-		return ErrUserDependencyUnavailable
+		return admin.ErrUserDependencyUnavailable
 	}
 	return f(r)
 }
