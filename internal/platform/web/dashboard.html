@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Atlas · Database Platform</title>
+  <link rel="stylesheet" href="/platform/assets/dashboard.css">
+  <script src="/platform/assets/core.js" defer></script><script src="/platform/assets/admin.js" defer></script>
+  <script src="/platform/assets/viewer.js" defer></script><script src="/platform/assets/analysis.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#content">Lewati navigasi</a>
+<header><a class="brand" href="/platform/">◈ Atlas <span>Database Platform</span></a><div class="account"><span id="identity">Memeriksa session…</span><button id="refresh-session" type="button">Perbarui session</button><a href="/">Halaman login</a></div></header>
+<div class="layout">
+<aside><p class="eyebrow">WORKSPACE</p><nav aria-label="Navigasi aplikasi">
+  <button data-panel="viewer" aria-current="page">Database viewer</button><button data-panel="analysis">Analisis query</button>
+  <p class="eyebrow" data-admin hidden>ADMINISTRASI</p><button data-panel="users" data-admin hidden>User</button>
+  <button data-panel="groups" data-admin hidden>Group &amp; akses</button><button data-panel="connections" data-admin hidden>Koneksi PostgreSQL</button>
+</nav><p class="aside-note">Izin database berasal dari group. Peran admin platform tidak otomatis memberikan akses data.</p></aside>
+<main id="content" tabindex="-1">
+<div id="notice" class="notice" role="status" aria-live="polite">Menunggu identitas backend terverifikasi.</div>
+<section id="panel-viewer" class="panel" aria-labelledby="viewer-heading">
+  <div class="section-head"><div><p class="eyebrow">EXPLORE</p><h1 id="viewer-heading">Database viewer</h1><p>Jelajahi struktur dan data dengan akses group yang berlaku.</p></div><button id="viewer-refresh" type="button">Muat ulang</button></div>
+  <div class="card selectors"><label>Database<select id="viewer-db" disabled><option value="">Pilih database</option></select></label><label>Schema<select id="viewer-schema" disabled><option value="">Pilih schema</option></select></label><label>Table<select id="viewer-table" disabled><option value="">Pilih table</option></select></label><span id="viewer-access" class="badge">Belum dipilih</span></div>
+  <p id="viewer-status" role="status">Login untuk melihat database yang dapat diakses.</p>
+  <div id="viewer-result" hidden>
+    <div class="tabs" role="group" aria-label="Informasi table"><button data-view="data" aria-pressed="true">Data</button><button data-view="columns" aria-pressed="false">Column</button><button data-view="constraints" aria-pressed="false">Constraint</button><button data-view="indexes" aria-pressed="false">Index</button></div>
+    <div id="viewer-data" class="card"><div id="viewer-rows" class="table-scroll" tabindex="0" aria-label="Data table"></div><div class="pager"><label>Baris per halaman<select id="viewer-limit"><option>25</option><option selected>50</option><option>100</option></select></label><span id="viewer-page"></span><button id="viewer-prev">Sebelumnya</button><button id="viewer-next">Berikutnya</button></div><p id="viewer-order" class="muted"></p></div>
+    <div id="viewer-columns" class="card table-scroll" tabindex="0" hidden></div><div id="viewer-constraints" class="card table-scroll" tabindex="0" hidden></div><div id="viewer-indexes" class="card table-scroll" tabindex="0" hidden></div>
+  </div>
+</section>
+<section id="panel-analysis" class="panel" aria-labelledby="analysis-heading" hidden>
+  <p class="eyebrow">QUERY INSIGHT</p><h1 id="analysis-heading">Analisis execution plan</h1><p>Tinjau rencana PostgreSQL sebelum menjalankan migration. Memerlukan View + Edit.</p>
+  <form id="analysis-form" class="card"><label>Database<select id="analysis-db" required><option value="">Pilih database</option></select></label><label>SQL<textarea id="analysis-sql" rows="9" required spellcheck="false" placeholder="SELECT * FROM public.nama_table WHERE id = 1"></textarea></label>
+    <label class="check"><input id="analysis-analyze" type="checkbox"> Sertakan EXPLAIN ANALYZE</label><p class="warning">ANALYZE benar-benar menjalankan SELECT. Hanya bentuk SELECT terbatas yang diterima. Rollback bukan jaminan menghapus semua efek samping; gunakan target dan akun database tepercaya.</p><p class="muted">EXPLAIN biasa mendukung SELECT, INSERT, UPDATE, DELETE, dan MERGE. DDL tidak didukung. Satu statement, maksimum 12 KiB.</p><button class="primary" type="submit">Analisis query</button>
+  </form><p id="analysis-status" role="status">Masukkan query untuk meninjau rencana.</p><div id="analysis-result" hidden><div id="analysis-summary" class="card"></div><div id="analysis-tree" class="card"></div><details class="card"><summary>Hasil JSON mentah</summary><pre id="analysis-raw"></pre></details></div>
+</section>
+<section id="panel-users" class="panel" aria-labelledby="users-heading" hidden>
+  <p class="eyebrow">PLATFORM ADMIN</p><h1 id="users-heading">User</h1><p>Kelola identitas dan peran platform; izin database tetap melalui group.</p>
+  <form id="user-form" class="card form-grid"><h2 id="user-form-title">Buat user</h2><input type="hidden" id="user-id"><label>Username<input id="user-name" required maxlength="128" autocomplete="off"></label><label id="user-password-label">Password baru<input id="user-password" type="password" minlength="12" maxlength="1024" required autocomplete="new-password"></label><label class="check"><input id="user-admin" type="checkbox">Platform Admin</label><label class="check" id="user-active-label" hidden><input id="user-active" type="checkbox" checked>User aktif</label><div class="actions"><button class="primary" type="submit">Simpan user</button><button id="user-cancel" type="button">Batalkan edit</button></div></form>
+  <div class="card"><div id="users-list" class="table-scroll" tabindex="0"></div><div class="pager"><span id="users-page"></span><button id="users-prev">Sebelumnya</button><button id="users-next">Berikutnya</button></div></div>
+</section>
+<section id="panel-groups" class="panel" aria-labelledby="groups-heading" hidden>
+  <p class="eyebrow">PLATFORM ADMIN</p><h1 id="groups-heading">Group &amp; akses</h1><form id="group-form" class="card form-grid"><input id="group-id" type="hidden"><label>Nama group<input id="group-name" required maxlength="128"></label><div class="actions"><button class="primary" type="submit">Simpan group</button><button id="group-cancel" type="button">Batalkan edit</button></div></form>
+  <div class="card"><div id="groups-list" class="table-scroll" tabindex="0"></div><div class="pager"><span id="groups-page"></span><button id="groups-prev">Sebelumnya</button><button id="groups-next">Berikutnya</button></div></div>
+  <section id="group-detail" hidden><h2 id="group-detail-name"></h2><div class="split"><div class="card"><h3>Anggota group</h3><form id="member-form"><label>ID user<input id="member-user" type="number" min="1" required list="user-options"></label><datalist id="user-options"></datalist><p class="muted">ID dapat dilihat pada daftar user.</p><button class="primary" type="submit">Tambahkan anggota</button></form><div id="members-list" class="table-scroll" tabindex="0"></div><div class="pager"><span id="members-page"></span><button id="members-prev">Sebelumnya</button><button id="members-next">Berikutnya</button></div></div>
+  <div class="card"><h3>Akses database</h3><form id="grant-form"><label>ID database<input id="grant-database" type="number" min="1" required list="database-options"></label><datalist id="database-options"></datalist><label>Tingkat akses<select id="grant-level"><option>View Only</option><option>View + Edit</option></select></label><p class="muted">Pemberian baru maupun perubahan disimpan atomik untuk pasangan group dan database.</p><button class="primary" type="submit">Simpan akses</button></form><div id="grants-list" class="table-scroll" tabindex="0"></div><div class="pager"><span id="grants-page"></span><button id="grants-prev">Sebelumnya</button><button id="grants-next">Berikutnya</button></div></div></div></section>
+</section>
+<section id="panel-connections" class="panel" aria-labelledby="connections-heading" hidden>
+  <p class="eyebrow">PLATFORM ADMIN</p><h1 id="connections-heading">Koneksi PostgreSQL</h1><p>Kredensial tersimpan terenkripsi dan tidak dikirim kembali ke browser.</p>
+  <form id="connection-form" class="card form-grid"><h2 id="connection-form-title">Tambah koneksi</h2><input id="connection-id" type="hidden"><label>Nama tampilan<input id="connection-name" required maxlength="256"></label><label>Host<input id="connection-host" required maxlength="256" placeholder="db.internal"></label><label>Port<input id="connection-port" type="number" min="1" max="65535" value="5432" required></label><label>Nama database<input id="connection-database" required maxlength="256"></label><label>Username PostgreSQL<input id="connection-username" required maxlength="256" autocomplete="off"></label><label>Password<input id="connection-password" type="password" autocomplete="new-password" maxlength="4096" placeholder="Kosong saat edit: pertahankan password lama"></label><label class="check"><input id="connection-clear-password" type="checkbox">Ganti password menjadi kosong secara eksplisit</label><label>Mode TLS<select id="connection-tls"><option>require</option><option>verify-full</option><option>verify-ca</option><option>prefer</option><option>allow</option><option>disable</option></select></label><label>Root certificate pada server<input id="connection-cert" maxlength="4096" placeholder="Path CA atau system (verify-full)"></label><div class="actions"><button class="primary" type="submit">Simpan koneksi</button><button id="connection-cancel" type="button">Batalkan edit</button></div></form>
+  <div class="card"><div id="connections-list" class="table-scroll" tabindex="0"></div><div class="pager"><span id="connections-page"></span><button id="connections-prev">Sebelumnya</button><button id="connections-next">Berikutnya</button></div></div>
+</section>
+<footer>Atlas · PostgreSQL workspace · Seluruh izin diperiksa kembali oleh backend.</footer>
+</main></div>
+</body></html>
