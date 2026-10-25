@@ -18,6 +18,7 @@ var (
 
 // AccessibleDatabase hanya membawa identitas konfigurasi dan tingkat akses tanpa kredensial koneksi target.
 type AccessibleDatabase struct {
+	Driver      string      `json:"driver"`
 	DatabaseID  int         `json:"database_id"`
 	Name        string      `json:"name"`
 	AccessLevel AccessLevel `json:"access_level"`

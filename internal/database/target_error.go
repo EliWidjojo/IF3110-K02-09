@@ -10,6 +10,7 @@ import (
 )
 
 var (
+	ErrInternalDatabaseTarget       = errors.New("database internal platform tidak boleh menjadi target pengguna")
 	ErrTargetConnectionFailed       = errors.New("operasi koneksi database target gagal")
 	ErrTargetConnectionNetwork      = errors.New("jaringan database target tidak tersedia")
 	ErrTargetConnectionAuth         = errors.New("authentication database target gagal")

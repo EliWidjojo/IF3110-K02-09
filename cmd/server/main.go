@@ -1,21 +1,20 @@
 package main
 
 import (
+	"IF3110-K02-09/internal/admin"
+	"IF3110-K02-09/internal/auth"
+	"IF3110-K02-09/internal/database"
+	"IF3110-K02-09/internal/platform"
+	"IF3110-K02-09/internal/server"
 	"context"
-	"encoding/json"
+	"database/sql"
 	"errors"
-	"fmt"
+	_ "github.com/lib/pq"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"regexp"
 	"time"
-
-	"IF3110-K02-09/internal/auth"
-	"IF3110-K02-09/internal/database"
-	"IF3110-K02-09/internal/migration"
-	"IF3110-K02-09/internal/server"
 )
 
 func env(name, fallback string) string {
@@ -25,18 +24,41 @@ func env(name, fallback string) string {
 	return fallback
 }
 func run() error {
-	store, err := auth.OpenStore(env("IDENTITY_FILE", "data/identity.json"))
-	if err != nil {
-		return errors.New("cannot open identity store")
+	if os.Getenv("PQGO_DEBUG") == "1" {
+		return errors.New("debug protokol database harus dinonaktifkan")
 	}
-	if store.Empty() {
-		name, password := os.Getenv("BOOTSTRAP_ADMIN_USERNAME"), os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
-		if name == "" || password == "" {
-			return errors.New("first startup requires BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD (12+ bytes)")
+	dsn := os.Getenv("PLATFORM_DATABASE_DSN")
+	if dsn == "" {
+		return errors.New("PLATFORM_DATABASE_DSN wajib tersedia")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return errors.New("konfigurasi database internal tidak valid")
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(15)
+	db.SetMaxIdleConns(3)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if db.PingContext(ctx) != nil {
+		return errors.New("database internal tidak dapat dihubungi")
+	}
+	if err = platform.EnsureSchema(ctx, db); err != nil {
+		return errors.New("schema internal tidak dapat disiapkan")
+	}
+	cipher, err := database.NewDatabasePasswordCipherFromEnv()
+	if err != nil {
+		return err
+	}
+	if path := os.Getenv("IMPORT_LEGACY_IDENTITY"); path != "" {
+		if err = platform.ImportLegacy(ctx, db, cipher, path, os.Getenv("IMPORT_LEGACY_DATABASES")); err != nil {
+			return err
 		}
-		if _, err = store.CreateUser(name, password, true); err != nil {
-			return errors.New("cannot create bootstrap admin; check username and password length")
-		}
+	}
+	store := auth.NewPostgresStore(db)
+	if err = store.Bootstrap(ctx, os.Getenv("BOOTSTRAP_ADMIN_USERNAME"), os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")); err != nil {
+		return err
 	}
 	_ = os.Unsetenv("BOOTSTRAP_ADMIN_PASSWORD")
 	sessions, err := auth.NewSessions(auth.DefaultSessionConfig())
@@ -47,43 +69,24 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	targets := map[string]*database.Target{}
-	defer func() {
-		for _, t := range targets {
-			t.DB.Close()
+	module, err := platform.NewPlatformModule(db, cipher, platform.SecurityDependencies{Identity: a, CSRF: a, Sessions: a, PasswordHasher: platform.PasswordHasherFunc(func(_ context.Context, password string) (admin.PasswordHash, error) {
+		hash, e := auth.HashPassword(password)
+		if e != nil {
+			return "", admin.ErrInvalidUserInput
 		}
-	}()
-	if file := os.Getenv("DATABASE_CONFIG"); file != "" {
-		b, err := os.ReadFile(file)
-		if err != nil {
-			return errors.New("cannot read DATABASE_CONFIG")
-		}
-		var configs []database.Config
-		if json.Unmarshal(b, &configs) != nil {
-			return errors.New("invalid DATABASE_CONFIG JSON")
-		}
-		validID := regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
-		for _, c := range configs {
-			if !validID.MatchString(c.ID) || targets[c.ID] != nil {
-				return errors.New("target IDs must be unique and contain only letters, digits, underscores or hyphens")
-			}
-			t, err := database.Open(context.Background(), c)
-			if err != nil {
-				return fmt.Errorf("cannot connect target %s", c.ID)
-			}
-			targets[c.ID] = t
-			if err := migration.NewMigrationServiceWithDialect(t.DB, t.Dialect).InitMigrationTable(); err != nil {
-				return fmt.Errorf("cannot initialize migration history for target %s", c.ID)
-			}
-		}
+		return admin.PasswordHash(hash), nil
+	})})
+	if err != nil {
+		return err
 	}
-	app := &http.Server{Addr: env("HTTP_ADDR", "127.0.0.1:8080"), Handler: server.New(a, targets), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 45 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer module.Close()
+	app := &http.Server{Addr: env("HTTP_ADDR", "127.0.0.1:8080"), Handler: server.New(a, module), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 45 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	go func() {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+		<-stopCtx.Done()
+		shutdown, done := context.WithTimeout(context.Background(), 10*time.Second)
+		defer done()
 		_ = app.Shutdown(shutdown)
 	}()
 	log.Print("Database platform started")
@@ -91,7 +94,7 @@ func run() error {
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
-	return err
+	return errors.New("server HTTP berhenti")
 }
 func main() {
 	if err := run(); err != nil {

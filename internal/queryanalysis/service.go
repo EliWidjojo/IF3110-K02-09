@@ -64,6 +64,13 @@ func (s *QueryAnalysisService) Analyze(ctx context.Context, databaseID int, inpu
 	if err := s.access.RequireEdit(ctx, databaseID); err != nil {
 		return QueryAnalysisResult{}, err
 	}
+	cfg, configErr := s.pools.Configuration(ctx, databaseID)
+	if configErr != nil {
+		return QueryAnalysisResult{}, configErr
+	}
+	if cfg.Driver != database.Postgres {
+		return QueryAnalysisResult{}, ErrUnsupportedAnalysis
+	}
 	validated, err := validateAnalysis(ctx, input.Query, input.Analyze)
 	if err != nil {
 		return QueryAnalysisResult{}, err

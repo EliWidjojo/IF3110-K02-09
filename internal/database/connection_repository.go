@@ -3,10 +3,12 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -22,32 +24,39 @@ var (
 )
 
 type CreateDatabaseConnectionParams struct {
-	Name         string `json:"name"`
-	Host         string `json:"host"`
-	Port         int    `json:"port"`
-	DatabaseName string `json:"database_name"`
-	Username     string `json:"username"`
-	SSLMode      string `json:"ssl_mode"`
-	SSLRootCert  string `json:"ssl_root_cert"`
-	Password     string `json:"-"`
+	Driver        Dialect `json:"driver"`
+	AuditUsername string  `json:"audit_username"`
+	AuditPassword string  `json:"-"`
+	Name          string  `json:"name"`
+	Host          string  `json:"host"`
+	Port          int     `json:"port"`
+	DatabaseName  string  `json:"database_name"`
+	Username      string  `json:"username"`
+	SSLMode       string  `json:"ssl_mode"`
+	SSLRootCert   string  `json:"ssl_root_cert"`
+	Password      string  `json:"-"`
 }
 
 // Password nil mempertahankan ciphertext lama, sedangkan pointer ke string kosong secara eksplisit mengganti password menjadi kosong.
 type UpdateDatabaseConnectionParams struct {
-	Name         *string `json:"name"`
-	Host         *string `json:"host"`
-	Port         *int    `json:"port"`
-	DatabaseName *string `json:"database_name"`
-	Username     *string `json:"username"`
-	SSLMode      *string `json:"ssl_mode"`
-	SSLRootCert  *string `json:"ssl_root_cert"`
-	Password     *string `json:"-"`
+	Driver        *Dialect `json:"driver"`
+	AuditUsername *string  `json:"audit_username"`
+	AuditPassword *string  `json:"-"`
+	Name          *string  `json:"name"`
+	Host          *string  `json:"host"`
+	Port          *int     `json:"port"`
+	DatabaseName  *string  `json:"database_name"`
+	Username      *string  `json:"username"`
+	SSLMode       *string  `json:"ssl_mode"`
+	SSLRootCert   *string  `json:"ssl_root_cert"`
+	Password      *string  `json:"-"`
 }
 
 // DatabaseConnectionCredentials hanya digunakan komponen backend berwenang dan tidak diserialisasi sebagai respons publik.
 type DatabaseConnectionCredentials struct {
 	Configuration DatabaseConnection `json:"-"`
 	Password      string             `json:"-"`
+	AuditPassword string             `json:"-"`
 }
 
 // Record internal memisahkan ciphertext dari model publik agar pengambilan konfigurasi tidak mengekspos rahasia.
@@ -77,7 +86,7 @@ func NewDatabaseConnectionRepository(db *sql.DB, passwords *DatabasePasswordCiph
 }
 
 const databaseConnectionColumns = `id, name, host, port, database_name, username, ssl_mode, ssl_root_cert,
-	COALESCE(octet_length(encrypted_credentials), 0) > 0 AS password_configured`
+	COALESCE(octet_length(encrypted_credentials), 0) > 0 AS password_configured,driver,audit_username`
 
 func (r *DatabaseConnectionRepository) Create(ctx context.Context, params CreateDatabaseConnectionParams) (DatabaseConnection, error) {
 	params, err := normalizedDatabaseConnectionCreate(params)
@@ -99,17 +108,17 @@ func (r *DatabaseConnectionRepository) Create(ctx context.Context, params Create
 	if err != nil {
 		return DatabaseConnection{}, databaseConnectionRepositoryError("gagal menyiapkan identitas koneksi", err)
 	}
-	ciphertext, err := r.passwords.encrypt(id, params.Password)
+	ciphertext, err := r.encryptSecrets(id, params.Password, params.AuditPassword)
 	if err != nil {
 		return DatabaseConnection{}, err
 	}
 	query := `
 		INSERT INTO platform.database_connections
-			(id, name, host, port, database_name, username, ssl_mode, ssl_root_cert, encrypted_credentials)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			(id, name, host, port, database_name, username, ssl_mode, ssl_root_cert, encrypted_credentials,driver,audit_username)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,$10,$11)
 		RETURNING ` + databaseConnectionColumns + `;`
 	connection, err := scanDatabaseConnection(tx.QueryRowContext(ctx, query, id, params.Name, params.Host,
-		params.Port, params.DatabaseName, params.Username, params.SSLMode, params.SSLRootCert, ciphertext))
+		params.Port, params.DatabaseName, params.Username, params.SSLMode, params.SSLRootCert, ciphertext, params.Driver, params.AuditUsername))
 	if err != nil {
 		return DatabaseConnection{}, databaseConnectionRepositoryError("gagal menyimpan konfigurasi", err)
 	}
@@ -173,7 +182,7 @@ func (r *DatabaseConnectionRepository) LoadCredentials(ctx context.Context, id i
 	err := r.db.QueryRowContext(ctx, query, id).Scan(&record.configuration.ID, &record.configuration.Name,
 		&record.configuration.Host, &record.configuration.Port, &record.configuration.DatabaseName,
 		&username, &record.configuration.SSLMode, &record.configuration.SSLRootCert,
-		&record.configuration.PasswordConfigured, &record.ciphertext)
+		&record.configuration.PasswordConfigured, &record.configuration.Driver, &record.configuration.AuditUsername, &record.ciphertext)
 	if err != nil {
 		return DatabaseConnectionCredentials{}, databaseConnectionRepositoryError("gagal mengambil kredensial koneksi", err)
 	}
@@ -181,26 +190,18 @@ func (r *DatabaseConnectionRepository) LoadCredentials(ctx context.Context, id i
 		return DatabaseConnectionCredentials{}, ErrInvalidDatabaseConnection
 	}
 	record.configuration.Username = username.String
-	password, err := r.passwords.decrypt(record.configuration.ID, record.ciphertext)
+	password, auditPassword, err := r.decryptSecrets(record.configuration.ID, record.ciphertext)
 	if err != nil {
 		return DatabaseConnectionCredentials{}, err
 	}
-	return DatabaseConnectionCredentials{Configuration: record.configuration, Password: password}, nil
+	return DatabaseConnectionCredentials{Configuration: record.configuration, Password: password, AuditPassword: auditPassword}, nil
 }
 
 func (r *DatabaseConnectionRepository) Update(ctx context.Context, id int, params UpdateDatabaseConnectionParams) (DatabaseConnection, error) {
 	if id <= 0 || !validDatabaseConnectionUpdate(params) {
 		return DatabaseConnection{}, ErrInvalidDatabaseConnection
 	}
-	// Interface nil menjadi SQL NULL agar COALESCE mempertahankan password lama tanpa membaca atau mendekripsinya.
 	var ciphertext any
-	if params.Password != nil {
-		encrypted, err := r.passwords.encrypt(id, *params.Password)
-		if err != nil {
-			return DatabaseConnection{}, err
-		}
-		ciphertext = encrypted
-	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return DatabaseConnection{}, databaseConnectionRepositoryError("gagal memulai pembaruan konfigurasi", err)
@@ -215,15 +216,35 @@ func (r *DatabaseConnectionRepository) Update(ctx context.Context, id int, param
 	if !validDatabaseConnectionConfiguration(mergedDatabaseConnection(current, params)) {
 		return DatabaseConnection{}, ErrInvalidDatabaseConnection
 	}
+	if params.Password != nil || params.AuditPassword != nil {
+		var stored []byte
+		if err = tx.QueryRowContext(ctx, `SELECT encrypted_credentials FROM platform.database_connections WHERE id=$1`, id).Scan(&stored); err != nil {
+			return DatabaseConnection{}, ErrDatabaseConnectionStorage
+		}
+		password, auditPassword, e := r.decryptSecrets(id, stored)
+		if e != nil {
+			return DatabaseConnection{}, e
+		}
+		if params.Password != nil {
+			password = *params.Password
+		}
+		if params.AuditPassword != nil {
+			auditPassword = *params.AuditPassword
+		}
+		ciphertext, err = r.encryptSecrets(id, password, auditPassword)
+		if err != nil {
+			return DatabaseConnection{}, err
+		}
+	}
 	query := `
 		UPDATE platform.database_connections SET
 			name = COALESCE($1, name), host = COALESCE($2, host), port = COALESCE($3, port),
 			database_name = COALESCE($4, database_name), username = COALESCE($5, username),
 			ssl_mode = COALESCE($6, ssl_mode), ssl_root_cert = COALESCE($7, ssl_root_cert),
-			encrypted_credentials = COALESCE($8, encrypted_credentials)
+			encrypted_credentials = COALESCE($8, encrypted_credentials),driver=COALESCE($10,driver),audit_username=COALESCE($11,audit_username)
 		WHERE id = $9 RETURNING ` + databaseConnectionColumns + `;`
 	connection, err := scanDatabaseConnection(tx.QueryRowContext(ctx, query, params.Name, params.Host,
-		params.Port, params.DatabaseName, params.Username, params.SSLMode, params.SSLRootCert, ciphertext, id))
+		params.Port, params.DatabaseName, params.Username, params.SSLMode, params.SSLRootCert, ciphertext, id, params.Driver, params.AuditUsername))
 	if err != nil {
 		return DatabaseConnection{}, databaseConnectionRepositoryError("gagal memperbarui konfigurasi", err)
 	}
@@ -291,14 +312,14 @@ func scanDatabaseConnection(row interface{ Scan(...any) error }) (DatabaseConnec
 	var connection DatabaseConnection
 	var username sql.NullString
 	err := row.Scan(&connection.ID, &connection.Name, &connection.Host, &connection.Port,
-		&connection.DatabaseName, &username, &connection.SSLMode, &connection.SSLRootCert, &connection.PasswordConfigured)
+		&connection.DatabaseName, &username, &connection.SSLMode, &connection.SSLRootCert, &connection.PasswordConfigured, &connection.Driver, &connection.AuditUsername)
 	connection.Username = username.String
 	return connection, err
 }
 
 func validDatabaseConnectionUpdate(params UpdateDatabaseConnectionParams) bool {
 	if params.Name == nil && params.Host == nil && params.Port == nil && params.DatabaseName == nil &&
-		params.Username == nil && params.SSLMode == nil && params.SSLRootCert == nil && params.Password == nil {
+		params.Username == nil && params.SSLMode == nil && params.SSLRootCert == nil && params.Password == nil && params.AuditUsername == nil && params.AuditPassword == nil && params.Driver == nil {
 		return false
 	}
 	for _, value := range []*string{params.Name, params.DatabaseName, params.Username} {
@@ -306,7 +327,7 @@ func validDatabaseConnectionUpdate(params UpdateDatabaseConnectionParams) bool {
 			return false
 		}
 	}
-	return (params.Host == nil || validConnectionHost(*params.Host)) &&
+	return (params.Driver == nil || params.Driver.Valid()) && (params.AuditUsername == nil || validOptionalConnectionText(*params.AuditUsername)) && (params.AuditPassword == nil || !strings.ContainsRune(*params.AuditPassword, 0)) && (params.Host == nil || validConnectionHost(*params.Host)) &&
 		(params.Port == nil || (*params.Port >= 1 && *params.Port <= 65535)) &&
 		(params.SSLMode == nil || validConnectionSSLMode(*params.SSLMode)) &&
 		(params.SSLRootCert == nil || validOptionalConnectionText(*params.SSLRootCert)) &&
@@ -314,14 +335,20 @@ func validDatabaseConnectionUpdate(params UpdateDatabaseConnectionParams) bool {
 }
 
 func normalizedDatabaseConnectionCreate(params CreateDatabaseConnectionParams) (CreateDatabaseConnectionParams, error) {
+	if params.Driver == "" {
+		params.Driver = Postgres
+	}
 	if params.Port == 0 {
 		params.Port = 5432
+		if params.Driver.IsMySQL() {
+			params.Port = 3306
+		}
 	}
 	if params.SSLMode == "" {
 		params.SSLMode = "require"
 	}
 	configuration := DatabaseConnection{
-		Name: params.Name, Host: params.Host, Port: params.Port, DatabaseName: params.DatabaseName,
+		Driver: params.Driver, AuditUsername: params.AuditUsername, Name: params.Name, Host: params.Host, Port: params.Port, DatabaseName: params.DatabaseName,
 		Username: params.Username, SSLMode: params.SSLMode, SSLRootCert: params.SSLRootCert,
 	}
 	if !validDatabaseConnectionConfiguration(configuration) || strings.ContainsRune(params.Password, '\x00') {
@@ -343,6 +370,12 @@ func mergedDatabaseConnection(configuration DatabaseConnection, params UpdateDat
 			*attribute.stored = *attribute.input
 		}
 	}
+	if params.Driver != nil {
+		configuration.Driver = *params.Driver
+	}
+	if params.AuditUsername != nil {
+		configuration.AuditUsername = *params.AuditUsername
+	}
 	if params.Port != nil {
 		configuration.Port = *params.Port
 	}
@@ -351,7 +384,7 @@ func mergedDatabaseConnection(configuration DatabaseConnection, params UpdateDat
 
 // Validasi gabungan menjaga pengaturan CA sistem tetap memakai verifikasi hostname penuh.
 func validDatabaseConnectionConfiguration(configuration DatabaseConnection) bool {
-	return validConnectionText(configuration.Name) && validConnectionHost(configuration.Host) &&
+	return configuration.Driver.Valid() && validOptionalConnectionText(configuration.AuditUsername) && validConnectionText(configuration.Name) && validConnectionHost(configuration.Host) &&
 		configuration.Port >= 1 && configuration.Port <= 65535 &&
 		validConnectionText(configuration.DatabaseName) && validConnectionText(configuration.Username) &&
 		validConnectionSSLMode(configuration.SSLMode) && validOptionalConnectionText(configuration.SSLRootCert) &&
@@ -399,4 +432,49 @@ func databaseConnectionRepositoryError(operation string, err error) error {
 		return fmt.Errorf("%s: %w: %w", operation, ErrDatabaseConnectionStorage, context.DeadlineExceeded)
 	}
 	return fmt.Errorf("%s: %w", operation, ErrDatabaseConnectionStorage)
+}
+
+type credentialEnvelope struct {
+	Format        string `json:"format"`
+	Password      string `json:"password"`
+	AuditPassword string `json:"audit_password"`
+}
+
+func (r *DatabaseConnectionRepository) encryptSecrets(id int, password, auditPassword string) ([]byte, error) {
+	b, err := json.Marshal(credentialEnvelope{"platform-credentials-v2", password, auditPassword})
+	if err != nil {
+		return nil, ErrDatabaseEncryption
+	}
+	defer clear(b)
+	return r.passwords.encrypt(id, string(b))
+}
+func (r *DatabaseConnectionRepository) decryptSecrets(id int, ciphertext []byte) (string, string, error) {
+	raw, err := r.passwords.decrypt(id, ciphertext)
+	if err != nil {
+		return "", "", err
+	}
+	var envelope credentialEnvelope
+	if json.Unmarshal([]byte(raw), &envelope) == nil && envelope.Format == "platform-credentials-v2" {
+		return envelope.Password, envelope.AuditPassword, nil
+	}
+	return raw, "", nil
+}
+
+// OpenAudit membuka akun pencatat terpisah tanpa membagikan kredensialnya kepada SQL pengguna.
+func (r *DatabaseConnectionRepository) OpenAudit(ctx context.Context, id int) (*sql.DB, DatabaseConnection, error) {
+	credentials, err := r.LoadCredentials(ctx, id)
+	if err != nil {
+		return nil, DatabaseConnection{}, err
+	}
+	c := credentials.Configuration
+	if c.AuditUsername == "" || c.AuditUsername == c.Username {
+		return nil, c, ErrInvalidDatabaseConnection
+	}
+	credentials.Configuration.Username = c.AuditUsername
+	credentials.Password = credentials.AuditPassword
+	if c.Driver.IsMySQL() {
+		credentials.Configuration.DatabaseName = HistorySchema(c.Driver, c.DatabaseName)
+	}
+	db, err := openConfiguredTarget(ctx, credentials, 5*time.Second)
+	return db, c, err
 }

@@ -11,6 +11,7 @@ import (
 	"IF3110-K02-09/internal/admin"
 	"IF3110-K02-09/internal/database"
 	"IF3110-K02-09/internal/httpapi"
+	"IF3110-K02-09/internal/migration"
 	"IF3110-K02-09/internal/queryanalysis"
 	"IF3110-K02-09/internal/viewer"
 )
@@ -33,6 +34,7 @@ type PlatformModule struct {
 	connections    *database.DatabaseConnectionService
 	viewer         *viewer.ViewerService
 	analysis       *queryanalysis.QueryAnalysisService
+	migration      *migration.Engine
 	security       SecurityDependencies
 }
 
@@ -58,6 +60,7 @@ func NewPlatformModule(db *sql.DB, cipher *database.DatabasePasswordCipher, secu
 		connections:    database.NewDatabaseConnectionService(repository, pools, users),
 		viewer:         viewer.NewViewerService(effectiveAccess, pools, viewer.NewViewerMetadataRepository()),
 		analysis:       queryanalysis.NewQueryAnalysisService(effectiveAccess, pools),
+		migration:      migration.NewEngine(effectiveAccess, pools, security.Identity),
 		security:       security,
 	}, nil
 }
@@ -69,8 +72,8 @@ func (m *PlatformModule) RegisterRoutes(mux *http.ServeMux) {
 	database.RegisterDatabaseConnectionRoutes(mux, database.NewDatabaseConnectionHandler(m.connections, m.security.CSRF))
 	viewer.RegisterViewerRoutes(mux, viewer.NewViewerHandler(m.viewer))
 	queryanalysis.RegisterQueryAnalysisRoutes(mux, queryanalysis.NewQueryAnalysisHandler(m.analysis, m.security.CSRF))
+	migration.RegisterRoutes(mux, migration.NewHandler(m.migration, m.security.CSRF))
 	mux.HandleFunc("/api/platform/me", m.handleIdentity)
-	RegisterDashboardRoutes(mux)
 }
 func (m *PlatformModule) Close() error {
 	if m == nil {

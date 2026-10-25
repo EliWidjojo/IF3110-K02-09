@@ -1,4 +1,2 @@
--- Local development/test credentials only. The target application is not a superuser.
-CREATE ROLE platform LOGIN PASSWORD 'local-target-password';
-ALTER DATABASE platform_target OWNER TO platform;
-GRANT ALL ON SCHEMA public TO platform;
+-- Setup Docker yang aktif berada di postgres-init.sh dan membaca rahasia dari environment.
+-- File ini dipertahankan sebagai penunjuk untuk checkout lama; tidak berisi kredensial atau perintah reset data.

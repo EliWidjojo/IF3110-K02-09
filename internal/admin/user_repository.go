@@ -123,6 +123,14 @@ func (r *UserRepository) Update(ctx context.Context, id int, params UpdateUserPa
 		return User{}, fmt.Errorf("%w: username tidak boleh kosong", ErrInvalidUserInput)
 	}
 
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return User{}, ErrUserStorage
+	}
+	defer tx.Rollback()
+	if err = guardLastAdmin(ctx, tx, id, params); err != nil {
+		return User{}, err
+	}
 	// Nilai nil mempertahankan atribut lama, sedangkan pointer bool memungkinkan penyimpanan nilai false.
 	query := `
 		UPDATE platform.users
@@ -132,26 +140,52 @@ func (r *UserRepository) Update(ctx context.Context, id int, params UpdateUserPa
 		WHERE id = $4
 		RETURNING id, username, is_active, is_platform_admin;
 	`
-	user, err := scanUser(r.db.QueryRowContext(ctx, query,
+	user, err := scanUser(tx.QueryRowContext(ctx, query,
 		params.Username, params.IsActive, params.IsPlatformAdmin, id))
 	if err != nil {
 		return User{}, userRepositoryError("gagal memperbarui user", err)
+	}
+	if tx.Commit() != nil {
+		return User{}, ErrUserStorage
 	}
 	return user, nil
 }
 
 // Deactivate tidak menghapus baris user sehingga identitas, keanggotaan, dan rujukan riwayat aktivitas tetap tersedia.
 func (r *UserRepository) Deactivate(ctx context.Context, id int) error {
-	result, err := r.db.ExecContext(ctx, `UPDATE platform.users SET is_active = FALSE WHERE id = $1;`, id)
-	if err != nil {
-		return userRepositoryError("gagal menonaktifkan user", err)
+	active := false
+	_, err := r.Update(ctx, id, UpdateUserParams{IsActive: &active})
+	return err
+}
+
+// Perubahan admin diserialkan agar dua request tidak dapat menghilangkan admin aktif terakhir.
+func guardLastAdmin(ctx context.Context, tx *sql.Tx, id int, params UpdateUserParams) error {
+	if _, err := tx.ExecContext(ctx, `LOCK TABLE platform.users IN EXCLUSIVE MODE`); err != nil {
+		return ErrUserStorage
 	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return userRepositoryError("gagal memeriksa hasil penonaktifan user", err)
+	var active, admin bool
+	if err := tx.QueryRowContext(ctx, `SELECT is_active,is_platform_admin FROM platform.users WHERE id=$1`, id).Scan(&active, &admin); err != nil {
+		return userRepositoryError("membaca user", err)
 	}
+	if active && admin && ((params.IsActive != nil && !*params.IsActive) || (params.IsPlatformAdmin != nil && !*params.IsPlatformAdmin)) {
+		var count int
+		if tx.QueryRowContext(ctx, `SELECT count(*) FROM platform.users WHERE is_active AND is_platform_admin`).Scan(&count) != nil {
+			return ErrUserStorage
+		}
+		if count <= 1 {
+			return fmt.Errorf("%w: admin aktif terakhir harus dipertahankan", ErrInvalidUserInput)
+		}
+	}
+	return nil
+}
+func (r *UserRepository) InvalidateSessions(ctx context.Context, id int) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE platform.users SET security_version=security_version+1 WHERE id=$1`, id)
+	if err != nil {
+		return ErrUserStorage
+	}
+	count, _ := result.RowsAffected()
 	if count == 0 {
-		return fmt.Errorf("gagal menonaktifkan user: %w", ErrUserNotFound)
+		return ErrUserNotFound
 	}
 	return nil
 }

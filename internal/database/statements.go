@@ -62,7 +62,7 @@ func Statements(input string, dialect Dialect, nonAtomicDDL bool) ([]string, err
 			}
 			continue
 		}
-		if i+1 < len(input) && input[i:i+2] == "--" {
+		if i+1 < len(input) && input[i:i+2] == "--" && (!dialect.IsMySQL() || i+2 == len(input) || unicode.IsSpace(rune(input[i+2]))) {
 			line = true
 			i++
 			cleaned.WriteByte(' ')
@@ -134,12 +134,27 @@ func Statements(input string, dialect Dialect, nonAtomicDDL bool) ([]string, err
 		if nonAtomicDDL && (!dialect.IsMySQL() || !ddl || len(result) != 1) {
 			return nil, errors.New("non_atomic_ddl is only for one MySQL/MariaDB DDL statement")
 		}
-		// Stored code could perform transaction control indirectly.
-		for _, word := range fields {
-			if word == "PROCEDURE" || word == "FUNCTION" || word == "TRIGGER" || word == "EVENT" {
-				return nil, errors.New("stored program migrations are unsupported")
+		if ddl && verb != "TRUNCATE" {
+			object := ""
+			if len(fields) > 1 {
+				object = fields[1]
+			}
+			if object == "OR" && len(fields) > 3 && fields[2] == "REPLACE" {
+				object = fields[3]
+			}
+			if (object == "UNIQUE" || object == "FULLTEXT" || object == "SPATIAL") && len(fields) > 2 {
+				object = fields[2]
+			}
+			if object == "ON" && len(fields) > 2 {
+				object = fields[2]
+			}
+			switch object {
+			case "TABLE", "INDEX", "VIEW", "SCHEMA", "SEQUENCE", "TYPE":
+			default:
+				return nil, errors.New("jenis objek DDL tidak didukung")
 			}
 		}
+
 	}
 	return result, nil
 }

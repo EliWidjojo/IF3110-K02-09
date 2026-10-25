@@ -14,10 +14,11 @@ import (
 	"time"
 
 	"IF3110-K02-09/internal/access"
+	"IF3110-K02-09/internal/httpapi"
 )
 
 type HTTP struct {
-	Store     *Store
+	Store     IdentityStore
 	Sessions  *Sessions
 	Origin    string
 	Secure    bool
@@ -30,7 +31,7 @@ type attempt struct {
 	start time.Time
 }
 
-func NewHTTP(store *Store, sessions *Sessions, origin string, production bool) (*HTTP, error) {
+func NewHTTP(store IdentityStore, sessions *Sessions, origin string, production bool) (*HTTP, error) {
 	u, err := url.Parse(origin)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" {
 		return nil, errors.New("APP_ORIGIN must be an HTTP(S) origin without a trailing slash")
@@ -69,7 +70,7 @@ func JSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 func Error(w http.ResponseWriter, status int, message string) {
-	JSON(w, status, map[string]string{"error": message})
+	httpapi.WriteJSON(w, status, nil, &httpapi.Error{Code: strings.ToLower(strings.ReplaceAll(http.StatusText(status), " ", "_")), Message: message})
 }
 func Decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))

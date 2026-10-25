@@ -41,6 +41,11 @@ func (s *ViewerService) ListSchemas(ctx context.Context, databaseID int) ([]View
 	if err != nil {
 		return nil, err
 	}
+	if cfg, e := s.pools.Configuration(ctx, databaseID); e != nil {
+		return nil, e
+	} else if cfg.Driver.IsMySQL() {
+		return (mysqlViewer{cfg.DatabaseName}).ListSchemas(ctx, db)
+	}
 	return s.metadata.ListSchemas(ctx, db)
 }
 
@@ -53,6 +58,11 @@ func (s *ViewerService) ListTables(ctx context.Context, databaseID int, schema s
 	db, err := s.readableDatabase(ctx, databaseID)
 	if err != nil {
 		return nil, err
+	}
+	if cfg, e := s.pools.Configuration(ctx, databaseID); e != nil {
+		return nil, e
+	} else if cfg.Driver.IsMySQL() {
+		return (mysqlViewer{cfg.DatabaseName}).ListTables(ctx, db, schema)
 	}
 	return s.metadata.ListTables(ctx, db, schema)
 }
@@ -79,6 +89,11 @@ func (s *ViewerService) ReadTableData(ctx context.Context, databaseID int, schem
 	if err != nil {
 		return ViewerTableData{}, err
 	}
+	if cfg, e := s.pools.Configuration(ctx, databaseID); e != nil {
+		return ViewerTableData{}, e
+	} else if cfg.Driver.IsMySQL() {
+		return (mysqlViewer{cfg.DatabaseName}).ReadTableData(ctx, db, schema, table, pagination)
+	}
 	return reader.ReadTableData(ctx, db, schema, table, pagination)
 }
 
@@ -99,6 +114,11 @@ func (s *ViewerService) GetTableMetadata(ctx context.Context, databaseID int, sc
 	db, err := s.readableDatabase(ctx, databaseID)
 	if err != nil {
 		return ViewerTableMetadata{}, err
+	}
+	if cfg, e := s.pools.Configuration(ctx, databaseID); e != nil {
+		return ViewerTableMetadata{}, e
+	} else if cfg.Driver.IsMySQL() {
+		return (mysqlViewer{cfg.DatabaseName}).GetTableMetadata(ctx, db, schema, table)
 	}
 	return reader.GetTableMetadata(ctx, db, schema, table)
 }

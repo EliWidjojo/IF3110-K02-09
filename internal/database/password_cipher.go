@@ -88,3 +88,7 @@ func databasePasswordAAD(databaseID int) []byte {
 
 func (*DatabasePasswordCipher) String() string   { return "[kunci kredensial disembunyikan]" }
 func (*DatabasePasswordCipher) GoString() string { return "[kunci kredensial disembunyikan]" }
+
+func (c *DatabasePasswordCipher) EncryptImportedPassword(id int, password string) ([]byte, error) {
+	return c.encrypt(id, password)
+}

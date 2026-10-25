@@ -16,13 +16,15 @@ import (
 )
 
 const (
+	ViewerMaxResultBytes  = 2 * 1024 * 1024
 	ViewerDefaultPageSize = 50
 	ViewerMaxPageSize     = 100
 )
 
 var (
-	ErrViewerTableNotFound = errors.New("tabel viewer tidak ditemukan")
-	ErrViewerTableData     = errors.New("pembacaan data tabel target gagal")
+	ErrViewerResultTooLarge = errors.New("hasil melebihi batas 2 MiB; pilih ukuran halaman lebih kecil")
+	ErrViewerTableNotFound  = errors.New("tabel viewer tidak ditemukan")
+	ErrViewerTableData      = errors.New("pembacaan data tabel target gagal")
 )
 
 type ViewerPagination struct {
@@ -122,6 +124,7 @@ func (r *ViewerMetadataRepository) ReadTableData(ctx context.Context, db *sql.DB
 		Limit: pagination.Limit, Offset: pagination.Offset,
 		OrderBy: primaryKey, StableOrder: len(primaryKey) > 0,
 	}
+	resultBytes := 0
 	for rows.Next() {
 		// Satu baris tambahan hanya mendeteksi halaman berikutnya tanpa menghitung seluruh isi tabel.
 		if len(result.Rows) == pagination.Limit {
@@ -137,6 +140,17 @@ func (r *ViewerMetadataRepository) ReadTableData(ctx context.Context, db *sql.DB
 			return ViewerTableData{}, viewerTableDataError(ctx, err)
 		}
 		for index, value := range values {
+			switch v := value.(type) {
+			case []byte:
+				resultBytes += len(v)
+			case string:
+				resultBytes += len(v)
+			default:
+				resultBytes += 32
+			}
+			if resultBytes > ViewerMaxResultBytes {
+				return ViewerTableData{}, ErrViewerResultTooLarge
+			}
 			values[index], err = viewerJSONValue(value, columnTypes[index].DatabaseTypeName())
 			if err != nil {
 				return ViewerTableData{}, err
@@ -163,7 +177,7 @@ func viewerTableRelation(ctx context.Context, tx *sql.Tx, schema, table string) 
 		LEFT JOIN pg_catalog.pg_class AS c
 			ON c.relnamespace = n.oid AND c.relname = $2 AND c.relkind IN ('r', 'p', 'f')
 		WHERE n.nspname = $1
-			AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema';
+			AND left(n.nspname, 3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform_migrations');
 	`
 	var relationID sql.NullInt64
 	var kind sql.NullString

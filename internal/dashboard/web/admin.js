@@ -37,9 +37,10 @@
   }
   async function selectGroup(group) { epoch++; selectedGroup = group; offsets.members = offsets.grants = 0; $("group-detail").hidden = false; $("group-detail-name").textContent = `${group.name} · #${group.id}`; await Promise.all([load("members"), load("grants")]); }
   function resetConnection() { $("connection-form").reset(); $("connection-id").value = ""; $("connection-form-title").textContent = "Tambah koneksi"; }
-  function editConnection(c) { resetConnection(); $("connection-id").value = c.id; $("connection-name").value = c.name; $("connection-host").value = c.host; $("connection-port").value = c.port; $("connection-database").value = c.database_name; $("connection-username").value = c.username; $("connection-tls").value = c.ssl_mode; $("connection-cert").value = c.ssl_root_cert; $("connection-form-title").textContent = `Edit koneksi #${c.id}`; $("connection-name").focus(); }
+  function editConnection(c) { resetConnection(); $("connection-driver").value=c.driver; $("connection-audit-username").value=c.audit_username; $("connection-id").value = c.id; $("connection-name").value = c.name; $("connection-host").value = c.host; $("connection-port").value = c.port; $("connection-database").value = c.database_name; $("connection-username").value = c.username; $("connection-tls").value = c.ssl_mode; $("connection-cert").value = c.ssl_root_cert; $("connection-form-title").textContent = `Edit koneksi #${c.id}`; $("connection-name").focus(); }
   function form(id, callback) { $(id).addEventListener("submit", event => { event.preventDefault(); app.action(() => callback(), event.submitter); }); }
   document.addEventListener("DOMContentLoaded", () => {
+ $("connection-driver").addEventListener("change",()=>{$("connection-port").value=$("connection-driver").value==="postgres"?5432:3306;});
     for (const kind of Object.keys(offsets)) for (const direction of ["prev", "next"]) $(`${kind}-${direction}`).addEventListener("click", () => { offsets[kind] = Math.max(0, offsets[kind] + (direction === "next" ? size : -size)); app.action(() => load(kind)); });
     $("user-cancel").addEventListener("click", resetUser); $("group-cancel").addEventListener("click", () => { $("group-form").reset(); $("group-id").value = ""; }); $("connection-cancel").addEventListener("click", resetConnection);
     form("user-form", async () => { const id = $("user-id").value; const body = { username: $("user-name").value, is_platform_admin: $("user-admin").checked }; if (id) { body.is_active = $("user-active").checked; if (!body.is_active && !confirm("Simpan user sebagai nonaktif dan cabut session miliknya?")) return; } else body.password = $("user-password").value; try { await app.api(id ? `${path.users}/${id}` : path.users, { method: id ? "PATCH" : "POST", body }); resetUser(); await load("users"); success("User disimpan."); } finally { $("user-password").value = ""; } });
@@ -48,12 +49,15 @@
     form("grant-form", async () => { if (!selectedGroup) throw new Error("Pilih group terlebih dahulu."); await app.api(`${path.groups}/${selectedGroup.id}/database-access/${encodeURIComponent($("grant-database").value)}`, { method: "PUT", body: { access_level: $("grant-level").value } }); await load("grants"); success("Akses group disimpan."); });
     form("connection-form", async () => {
       const id = $("connection-id").value, password = $("connection-password").value;
-      const body = { name: $("connection-name").value, host: $("connection-host").value, port: Number($("connection-port").value), database_name: $("connection-database").value, username: $("connection-username").value, ssl_mode: $("connection-tls").value, ssl_root_cert: $("connection-cert").value };
+      const body = { driver:$("connection-driver").value,audit_username:$("connection-audit-username").value,name: $("connection-name").value, host: $("connection-host").value, port: Number($("connection-port").value), database_name: $("connection-database").value, username: $("connection-username").value, ssl_mode: $("connection-tls").value, ssl_root_cert: $("connection-cert").value };
       if (body.ssl_root_cert === "system" && body.ssl_mode !== "verify-full") throw new Error("Root certificate system memerlukan TLS verify-full.");
       if (password && $("connection-clear-password").checked) throw new Error("Pilih password baru atau pengosongan password, bukan keduanya.");
       // Password edit yang kosong tidak dikirim kecuali pengguna secara eksplisit memilih penggantian menjadi kosong.
-      if (!id || password || $("connection-clear-password").checked) body.password = $("connection-clear-password").checked ? "" : password;
-      try { await app.api(id ? `${path.connections}/${id}` : path.connections, { method: id ? "PATCH" : "POST", body }); resetConnection(); await load("connections"); success("Konfigurasi disimpan dan pool terkait diinvalidasi."); } finally { $("connection-password").value = ""; }
+      const auditPassword=$("connection-audit-password").value;
+ if(auditPassword && $("connection-clear-audit-password").checked)throw new Error("Pilih password pencatat baru atau pengosongan eksplisit.");
+ if(!id || auditPassword || $("connection-clear-audit-password").checked)body.audit_password=$("connection-clear-audit-password").checked?"":auditPassword;
+ if (!id || password || $("connection-clear-password").checked) body.password = $("connection-clear-password").checked ? "" : password;
+      try { await app.api(id ? `${path.connections}/${id}` : path.connections, { method: id ? "PATCH" : "POST", body }); resetConnection(); await load("connections"); success("Konfigurasi disimpan dan pool terkait diinvalidasi."); } finally { $("connection-password").value = ""; $("connection-audit-password").value=""; }
     });
   });
   window.addEventListener("platform:panel", event => { if (["users", "groups", "connections"].includes(event.detail)) app.action(() => load(event.detail)); });

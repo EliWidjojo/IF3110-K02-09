@@ -31,6 +31,7 @@ func RegisterUserRoutes(mux *http.ServeMux, handler *UserHandler) {
 	mux.HandleFunc("/api/admin/users", handler.HandleUsers)
 	mux.HandleFunc("/api/admin/users/{id}", handler.HandleUser)
 	mux.HandleFunc("/api/admin/users/{id}/deactivate", handler.HandleDeactivateUser)
+	mux.HandleFunc("/api/admin/users/{id}/revoke-sessions", handler.HandleRevokeSessions)
 }
 
 func (h *UserHandler) HandleUsers(w http.ResponseWriter, r *http.Request) {
@@ -207,4 +208,24 @@ func WriteUserServiceError(w http.ResponseWriter, err error) {
 		status, apiError = http.StatusServiceUnavailable, &httpapi.Error{Code: "dependency_unavailable", Message: "komponen pengelolaan user belum tersedia"}
 	}
 	httpapi.WriteJSON(w, status, nil, apiError)
+}
+
+func (h *UserHandler) HandleRevokeSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpapi.WriteMethodError(w, "POST")
+		return
+	}
+	if !h.prepareRequest(w, r, true) {
+		return
+	}
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id <= 0 {
+		WriteUserServiceError(w, ErrInvalidUserInput)
+		return
+	}
+	if err = h.service.RevokeSessions(r.Context(), id); err != nil {
+		WriteUserServiceError(w, err)
+		return
+	}
+	httpapi.WriteJSON(w, 200, map[string]string{"message": "session dicabut"}, nil)
 }

@@ -135,6 +135,8 @@ func viewerResponseValue(value any, valueType string) (any, error) {
 			return nil, ErrViewerTableData
 		}
 		switch valueType {
+		case "BIGINT", "INT", "SMALLINT":
+			return viewerTypedValueResponse{Type: "integer", Value: text}, nil
 		case "NUMERIC":
 			return viewerTypedValueResponse{Type: "numeric", Value: text}, nil
 		case "JSON", "JSONB":

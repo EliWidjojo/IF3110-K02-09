@@ -48,7 +48,7 @@ func (r *ViewerMetadataRepository) ListSchemas(ctx context.Context, db *sql.DB) 
 	const query = `
 		SELECT n.nspname
 		FROM pg_catalog.pg_namespace AS n
-		WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+		WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform_migrations')
 		ORDER BY n.nspname COLLATE "C" ASC;
 	`
 	rows, err := db.QueryContext(ctx, query)
@@ -84,7 +84,7 @@ func (r *ViewerMetadataRepository) ListTables(ctx context.Context, db *sql.DB, s
 		LEFT JOIN pg_catalog.pg_class AS c
 			ON c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'f')
 		WHERE n.nspname = $1
-			AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+			AND left(n.nspname, 3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform_migrations')
 		ORDER BY c.relname COLLATE "C" ASC, c.oid ASC;
 	`
 	rows, err := db.QueryContext(ctx, query, schema)

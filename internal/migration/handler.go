@@ -1,77 +1,122 @@
 package migration
 
 import (
-	"IF3110-K02-09/internal/access"
-	"IF3110-K02-09/internal/auth"
+	"IF3110-K02-09/internal/admin"
+	"IF3110-K02-09/internal/httpapi"
+	"IF3110-K02-09/internal/viewer"
+	"errors"
 	"net/http"
+	"strconv"
 )
 
-type MigrationHandler struct {
-	Service    *MigrationService
-	DatabaseID string
+type Handler struct {
+	engine *Engine
+	csrf   admin.UserCSRFVerifier
 }
 
-func NewMigrationHandler(service *MigrationService) *MigrationHandler {
-	return &MigrationHandler{Service: service, DatabaseID: "default"}
+func NewHandler(engine *Engine, csrf admin.UserCSRFVerifier) *Handler { return &Handler{engine, csrf} }
+func RegisterRoutes(mux *http.ServeMux, h *Handler) {
+	mux.HandleFunc("GET /api/databases/{database_id}/migrations/history", h.History)
+	mux.HandleFunc("POST /api/databases/{database_id}/migrations/execute", h.Execute)
+	mux.HandleFunc("POST /api/databases/{database_id}/migrations/diff", h.Diff)
 }
-
-func NewDatabaseHandler(service *MigrationService, id string) *MigrationHandler {
-	return &MigrationHandler{Service: service, DatabaseID: id}
+func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, mutate bool) (int, bool) {
+	id, err := strconv.Atoi(r.PathValue("database_id"))
+	if err != nil || id <= 0 {
+		httpapi.WriteJSON(w, 400, nil, &httpapi.Error{Code: "invalid_input", Message: "ID database tidak valid"})
+		return 0, false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, httpapi.MaxRequestBytes)
+	if mutate {
+		if h.csrf == nil || h.csrf.ValidateCSRF(r) != nil {
+			admin.WriteUserServiceError(w, admin.ErrInvalidUserCSRF)
+			return 0, false
+		}
+	}
+	return id, true
 }
-func (h *MigrationHandler) authorize(w http.ResponseWriter, r *http.Request, action access.Action) (access.Principal, bool) {
-	p, ok := access.FromContext(r.Context())
+func (h *Handler) History(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.prepare(w, r, false)
 	if !ok {
-		auth.Error(w, 401, "authentication required")
-		return p, false
-	}
-	if !access.Allowed(p, h.DatabaseID, action) {
-		auth.Error(w, 403, "database access denied")
-		return p, false
-	}
-	return p, true
-}
-
-func (h *MigrationHandler) HandleExecuteMigration(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	p, ok := h.authorize(w, r, access.WriteMigration)
+	limit, e1 := httpapi.PaginationValue(r, "limit", 50)
+	offset, e2 := httpapi.PaginationValue(r, "offset", 0)
+	if e1 != nil || e2 != nil || limit < 1 || limit > 100 || offset < 0 {
+		httpapi.WriteJSON(w, 400, nil, &httpapi.Error{Code: "invalid_input", Message: "pagination tidak valid"})
+		return
+	}
+	rows, latest, err := h.engine.History(r.Context(), id, limit, offset)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	httpapi.WriteJSON(w, 200, map[string]any{"attempts": rows, "latest_version": latest, "limit": limit, "offset": offset}, nil)
+}
+func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.prepare(w, r, true)
 	if !ok {
+		return
+	}
+	if err := h.engine.access.RequireEdit(r.Context(), id); err != nil {
+		writeError(w, err)
 		return
 	}
 	var req MigrationRequest
-	if !auth.Decode(w, r, &req) {
+	if !httpapi.DecodeJSON(w, r, &req) {
 		return
 	}
-	req.UserID, req.UserAccess = p.ID, string(p.Databases[h.DatabaseID])
-
-	err := h.Service.ExecuteMigrationContext(r.Context(), req)
+	result, err := h.engine.Run(r.Context(), id, req)
 	if err != nil {
-		auth.Error(w, http.StatusBadRequest, "migration failed; check version, SQL, and DBMS transaction limitations")
+		switch {
+		case errors.Is(err, ErrVersionConflict):
+			httpapi.WriteJSON(w, 409, result, &httpapi.Error{Code: "version_conflict", Message: err.Error()})
+		case errors.Is(err, ErrMigrationFailed):
+			httpapi.WriteJSON(w, 422, result, &httpapi.Error{Code: "migration_failed", Message: "Migration gagal. Lihat status dan SQLSTATE pada history; periksa SQL serta privilege target."})
+		default:
+			writeError(w, err)
+		}
 		return
 	}
-
-	auth.JSON(w, http.StatusOK, map[string]any{"message": "Migrasi berhasil dieksekusi", "atomic": !req.NonAtomicDDL})
+	httpapi.WriteJSON(w, 200, result, nil)
 }
-
-func (h *MigrationHandler) HandleGetHistory(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	p, ok := h.authorize(w, r, access.ViewHistory)
+func (h *Handler) Diff(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.prepare(w, r, true)
 	if !ok {
 		return
 	}
-
-	histories, err := h.Service.GetMigrationHistoryContext(r.Context(), string(p.Databases[h.DatabaseID]))
-	if err != nil {
-		auth.Error(w, http.StatusServiceUnavailable, "migration history unavailable")
+	var desired DesiredSchema
+	if !httpapi.DecodeJSON(w, r, &desired) {
 		return
 	}
-
-	auth.JSON(w, http.StatusOK, histories)
+	result, err := h.engine.Diff(r.Context(), id, desired)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	httpapi.WriteJSON(w, 200, result, nil)
+}
+func writeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrNeedsReview) || errors.Is(err, ErrLegacyHistory) {
+		httpapi.WriteJSON(w, 409, nil, &httpapi.Error{Code: "history_review_required", Message: err.Error()})
+		return
+	}
+	if errors.Is(err, ErrUnsafeTarget) {
+		httpapi.WriteJSON(w, 503, nil, &httpapi.Error{Code: "unsafe_target", Message: ErrUnsafeTarget.Error()})
+		return
+	}
+	if errors.Is(err, ErrOutcomeUnknown) {
+		httpapi.WriteJSON(w, 503, nil, &httpapi.Error{Code: "outcome_unknown", Message: ErrOutcomeUnknown.Error()})
+		return
+	}
+	var invalid *InputError
+	if errors.As(err, &invalid) {
+		httpapi.WriteJSON(w, 400, nil, &httpapi.Error{Code: "invalid_input", Message: invalid.Error()})
+		return
+	}
+	if errors.Is(err, ErrInvalidMigration) {
+		httpapi.WriteJSON(w, 400, nil, &httpapi.Error{Code: "invalid_migration", Message: err.Error()})
+		return
+	}
+	viewer.WriteError(w, err)
 }

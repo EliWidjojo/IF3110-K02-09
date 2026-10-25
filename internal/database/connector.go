@@ -2,7 +2,11 @@ package database
 
 import (
 	"context"
+	"crypto/tls"
+	"database/sql"
 	"database/sql/driver"
+	"fmt"
+	"github.com/go-sql-driver/mysql"
 	"net"
 	"os"
 	"path/filepath"
@@ -53,7 +57,7 @@ func (c *targetPostgresConnector) Connect(ctx context.Context) (driver.Conn, err
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, c.configuration.ConnectTimeout)
 	defer cancel()
-	dialer := &targetContextDialer{dialer: net.Dialer{Timeout: c.configuration.ConnectTimeout, KeepAlive: 30 * time.Second}}
+	dialer := &targetContextDialer{handshake: connectCtx, dialer: net.Dialer{Timeout: c.configuration.ConnectTimeout, KeepAlive: 30 * time.Second}}
 	connector, err := pq.NewConnectorConfig(c.configuration)
 	if err != nil {
 		return nil, WrapTargetError("menyiapkan koneksi target", err)
@@ -85,6 +89,7 @@ type targetDialCancellation struct {
 
 // Dialer dibuat untuk satu Connect agar context juga membatalkan handshake TLS dan authentication yang sedang berjalan.
 type targetContextDialer struct {
+	handshake     context.Context
 	dialer        net.Dialer
 	cancellations []targetDialCancellation
 }
@@ -105,7 +110,12 @@ func (d *targetContextDialer) DialContext(ctx context.Context, network, address 
 		return nil, err
 	}
 	done := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
+	// Context dial milik driver dapat berakhir sebelum handshake; pengawasan mengikuti umur Connect.
+	watch := d.handshake
+	if watch == nil {
+		watch = ctx
+	}
+	stop := context.AfterFunc(watch, func() {
 		defer close(done)
 		connection.Close()
 	})
@@ -119,4 +129,55 @@ func (d *targetContextDialer) finish() {
 			<-cancellation.done
 		}
 	}
+}
+
+func openConfiguredTarget(ctx context.Context, credentials DatabaseConnectionCredentials, timeout time.Duration) (*sql.DB, error) {
+	c := credentials.Configuration
+	var db *sql.DB
+	if c.Driver.IsMySQL() {
+		cfg := mysql.NewConfig()
+		cfg.User = c.Username
+		cfg.Passwd = credentials.Password
+		cfg.Net = "tcp"
+		cfg.Addr = net.JoinHostPort(c.Host, fmt.Sprint(c.Port))
+		cfg.DBName = c.DatabaseName
+		cfg.ParseTime = true
+		cfg.Params = map[string]string{"time_zone": "'+00:00'"}
+		cfg.Loc = time.UTC
+		cfg.Timeout = timeout
+		cfg.ReadTimeout = 35 * time.Second
+		cfg.WriteTimeout = timeout
+		cfg.MultiStatements = false
+		cfg.AllowAllFiles = false
+		if c.SSLMode != "disable" {
+			if c.SSLMode != "require" && c.SSLMode != "verify-full" {
+				return nil, ErrInvalidDatabaseConnection
+			}
+			if c.SSLRootCert != "" && c.SSLRootCert != "system" {
+				return nil, ErrInvalidDatabaseConnection
+			}
+			cfg.TLS = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: c.Host}
+		}
+		connector, err := mysql.NewConnector(cfg)
+		if err != nil {
+			return nil, ErrInvalidDatabaseConnection
+		}
+		db = sql.OpenDB(connector)
+	} else {
+		connector, err := newTargetPostgresConnector(credentials, timeout)
+		if err != nil {
+			return nil, err
+		}
+		db = sql.OpenDB(connector)
+	}
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	pingCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		db.Close()
+		return nil, WrapTargetError("membuka target", err)
+	}
+	return db, nil
 }

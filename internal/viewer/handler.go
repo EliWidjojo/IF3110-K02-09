@@ -101,6 +101,12 @@ func WriteError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	apiError := &httpapi.Error{Code: "internal_error", Message: "operasi viewer gagal"}
 	switch {
+	case errors.Is(err, database.ErrInternalDatabaseTarget):
+		httpapi.WriteJSON(w, 400, nil, &httpapi.Error{Code: "internal_database_target", Message: database.ErrInternalDatabaseTarget.Error()})
+		return
+	case errors.Is(err, ErrViewerResultTooLarge):
+		httpapi.WriteJSON(w, 413, nil, &httpapi.Error{Code: "result_too_large", Message: ErrViewerResultTooLarge.Error()})
+		return
 	case errors.Is(err, admin.ErrUnauthenticated), errors.Is(err, admin.ErrUserNotFound):
 		status, apiError = http.StatusUnauthorized, &httpapi.Error{Code: "unauthenticated", Message: "authentication diperlukan"}
 	case errors.Is(err, access.ErrDatabaseAccessDenied), errors.Is(err, access.ErrInactiveUser):

@@ -22,7 +22,7 @@ func (r *EffectiveAccessRepository) GetUserAccess(ctx context.Context, userID in
 		return UserAccessSnapshot{}, ErrInvalidAccessInput
 	}
 	query := `
-		SELECT u.is_active, d.id, d.name, a.access_level
+		SELECT u.is_active, d.id, d.name, a.access_level,d.driver
 		FROM platform.users AS u
 		LEFT JOIN platform.group_memberships AS m ON m.user_id = u.id
 		LEFT JOIN platform.group_database_access AS a ON a.group_id = m.group_id
@@ -40,8 +40,8 @@ func (r *EffectiveAccessRepository) GetUserAccess(ctx context.Context, userID in
 	found := false
 	for rows.Next() {
 		var databaseID sql.NullInt64
-		var name, level sql.NullString
-		if err := rows.Scan(&snapshot.IsActive, &databaseID, &name, &level); err != nil {
+		var name, level, driver sql.NullString
+		if err := rows.Scan(&snapshot.IsActive, &databaseID, &name, &level, &driver); err != nil {
 			return UserAccessSnapshot{}, fmt.Errorf("%w: %w", ErrAccessStorage, err)
 		}
 		found = true
@@ -53,7 +53,7 @@ func (r *EffectiveAccessRepository) GetUserAccess(ctx context.Context, userID in
 			return UserAccessSnapshot{}, ErrAccessStorage
 		}
 		snapshot.Grants = append(snapshot.Grants, AccessibleDatabase{
-			DatabaseID: int(databaseID.Int64), Name: name.String, AccessLevel: AccessLevel(level.String),
+			Driver: driver.String, DatabaseID: int(databaseID.Int64), Name: name.String, AccessLevel: AccessLevel(level.String),
 		})
 	}
 	if err := rows.Err(); err != nil {

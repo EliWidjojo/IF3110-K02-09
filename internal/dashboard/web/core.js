@@ -13,7 +13,7 @@
     try { data = response.status === 204 ? {} : await response.json(); } catch { throw new Error("Respons server tidak dapat dibaca. Periksa pemasangan route backend."); }
     if (!response.ok) {
       if (response.status === 401 || response.status === 403) { app.invalidate(); app.user = null; syncAdmin(); $("identity").textContent = response.status === 401 ? "Session tidak berlaku. Silakan login." : "Perbarui identitas dan hak akses."; }
-      const error = new Error(typeof data.error === "string" ? data.error : data.error?.message || `Operasi ditolak (${response.status}).`); error.status = response.status; error.code = data.error?.code; throw error;
+      const error = new Error(typeof data.error === "string" ? data.error : data.error?.message || `Operasi ditolak (${response.status}).`); error.status = response.status; error.result=data.data; error.code = data.error?.code; throw error;
     }
     return data;
   }
@@ -62,5 +62,5 @@
     try { app.user = await app.api("/api/platform/me"); syncAdmin(); $("identity").textContent = `${app.user.username} · ${app.user.is_platform_admin ? "Platform Admin" : "Pengguna"}`; app.notice("Terhubung. Hak akses dibaca kembali pada setiap operasi."); window.dispatchEvent(new Event("platform:ready")); }
     catch (error) { $("identity").textContent = "Belum terhubung"; app.notice(error.message, true); }
   }
-  document.addEventListener("DOMContentLoaded", () => { document.querySelectorAll("[data-panel]").forEach(button => button.addEventListener("click", () => app.show(button.dataset.panel))); $("refresh-session").addEventListener("click", identity); identity(); });
+  document.addEventListener("DOMContentLoaded", () => { document.querySelectorAll("[data-panel]").forEach(button => button.addEventListener("click", () => app.show(button.dataset.panel))); $("refresh-session").addEventListener("click", identity); $("logout").addEventListener("click",()=>app.action(async()=>{await app.api("/api/auth/logout",{method:"POST"});app.invalidate();window.location.assign("/");})); identity(); });
 })();

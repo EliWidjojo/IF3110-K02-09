@@ -23,15 +23,17 @@ type targetPoolState struct {
 }
 
 type TargetConnectionManager struct {
-	repository *DatabaseConnectionRepository
-	options    TargetPoolOptions
-	mu         sync.Mutex
-	pools      map[int]*targetPoolState
-	shutdown   context.Context
-	cancel     context.CancelFunc
-	closed     bool
-	closeDone  chan struct{}
-	closeErr   error
+	repository      *DatabaseConnectionRepository
+	options         TargetPoolOptions
+	mu              sync.Mutex
+	pools           map[int]*targetPoolState
+	shutdown        context.Context
+	cancel          context.CancelFunc
+	closed          bool
+	closeDone       chan struct{}
+	closeErr        error
+	internalName    string
+	internalStarted time.Time
 }
 
 // Constructor memasang invalidasi pada instance repository yang sama agar Update dan Delete menutup pool terkait.
@@ -47,6 +49,10 @@ func NewTargetConnectionManager(repository *DatabaseConnectionRepository, option
 	manager := &TargetConnectionManager{
 		repository: repository, options: options, pools: make(map[int]*targetPoolState),
 		shutdown: shutdown, cancel: cancel, closeDone: make(chan struct{}),
+	}
+	if err := repository.db.QueryRow(`SELECT current_database(),pg_postmaster_start_time()`).Scan(&manager.internalName, &manager.internalStarted); err != nil {
+		cancel()
+		return nil, ErrTargetManagerUnavailable
 	}
 	if err := repository.attachTargetPools(manager); err != nil {
 		cancel()
@@ -96,15 +102,28 @@ func (m *TargetConnectionManager) Get(ctx context.Context, databaseID int) (*sql
 		if err != nil {
 			return nil, WrapTargetError("memuat konfigurasi target", err)
 		}
-		connector, err := newTargetPostgresConnector(credentials, m.options.ConnectTimeout)
+		state.db, err = openConfiguredTarget(operationCtx, credentials, m.options.ConnectTimeout)
 		if err != nil {
 			return nil, WrapTargetError("menyiapkan pool target", err)
 		}
-		state.db = sql.OpenDB(connector)
 		state.db.SetMaxOpenConns(m.options.MaxOpenConns)
 		state.db.SetMaxIdleConns(m.options.MaxIdleConns)
 		state.db.SetConnMaxLifetime(m.options.ConnMaxLifetime)
 		state.db.SetConnMaxIdleTime(m.options.ConnMaxIdleTime)
+		if credentials.Configuration.Driver == Postgres {
+			var name string
+			var started time.Time
+			if state.db.QueryRowContext(operationCtx, `SELECT current_database(),pg_postmaster_start_time()`).Scan(&name, &started) != nil {
+				state.db.Close()
+				state.db = nil
+				return nil, ErrTargetConnectionFailed
+			}
+			if name == m.internalName && started.Equal(m.internalStarted) {
+				state.db.Close()
+				state.db = nil
+				return nil, ErrInternalDatabaseTarget
+			}
+		}
 	}
 	if err := state.db.PingContext(operationCtx); err != nil {
 		pool := state.db
@@ -219,4 +238,11 @@ func normalizedTargetPoolOptions(options TargetPoolOptions) (TargetPoolOptions, 
 		options.ConnMaxIdleTime = 5 * time.Minute
 	}
 	return options, nil
+}
+
+func (m *TargetConnectionManager) Configuration(ctx context.Context, id int) (DatabaseConnection, error) {
+	return m.repository.GetByID(ctx, id)
+}
+func (m *TargetConnectionManager) OpenAudit(ctx context.Context, id int) (*sql.DB, DatabaseConnection, error) {
+	return m.repository.OpenAudit(ctx, id)
 }

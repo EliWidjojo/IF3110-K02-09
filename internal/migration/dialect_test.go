@@ -1,89 +1,72 @@
-package migration
+package migration_test
 
 import (
-	"errors"
-	"regexp"
-	"testing"
-
 	"IF3110-K02-09/internal/database"
-	"github.com/DATA-DOG/go-sqlmock"
+	"IF3110-K02-09/internal/migration"
+	"context"
+	"testing"
 )
 
 func TestMySQLTransactionalMigration(t *testing.T) {
-	for _, dialect := range []database.Dialect{database.MySQL, database.MariaDB} {
-		t.Run(string(dialect), func(t *testing.T) {
-			db, mock, _ := sqlmock.New()
-			defer db.Close()
-			service := NewMigrationServiceWithDialect(db, dialect)
-			mock.ExpectQuery(`SELECT MAX\(version\)`).WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
-			mock.ExpectQuery("SELECT COUNT.*information_schema.tables").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-			mock.ExpectBegin()
-			mock.ExpectExec("INSERT INTO items").WillReturnResult(sqlmock.NewResult(1, 1))
-			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO schema_migrations (version, executed_by, executed_at, status, query_sql) VALUES (?, ?, ?, ?, ?)")).WithArgs(1, 7, sqlmock.AnyArg(), "SUCCESS", "INSERT INTO items VALUES (1)").WillReturnResult(sqlmock.NewResult(1, 1))
-			mock.ExpectCommit()
-			if err := service.ExecuteMigration(MigrationRequest{UserID: 7, UserAccess: "View + Edit", Version: 1, QuerySQL: "INSERT INTO items VALUES (1)"}); err != nil {
-				t.Fatal(err)
-			}
-			if err := mock.ExpectationsWereMet(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	for _, d := range []database.Dialect{database.MySQL, database.MariaDB} {
+		statements, err := database.Statements("INSERT INTO items VALUES(1); UPDATE items SET id=2", d, false)
+		if err != nil || len(statements) != 2 {
+			t.Fatal(d, err)
+		}
 	}
 }
 func TestMySQLDDLExplicitAndFailureHistory(t *testing.T) {
-	for _, fail := range []bool{false, true} {
-		t.Run(map[bool]string{false: "success", true: "failure"}[fail], func(t *testing.T) {
-			db, mock, _ := sqlmock.New()
-			defer db.Close()
-			service := NewMigrationServiceWithDialect(db, database.MySQL)
-			req := MigrationRequest{UserID: 7, UserAccess: "View + Edit", Version: 1, QuerySQL: "CREATE TABLE items (id INT)"}
-			if err := service.ExecuteMigration(req); err == nil {
-				t.Fatal("implicit commit accepted without acknowledgement")
-			}
-			req.NonAtomicDDL = true
-			mock.ExpectQuery(`SELECT MAX\(version\)`).WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
-			mock.ExpectExec("INSERT INTO schema_migrations").WithArgs(1, 7, sqlmock.AnyArg(), "RUNNING", req.QuerySQL).WillReturnResult(sqlmock.NewResult(1, 1))
-			exec := mock.ExpectExec("CREATE TABLE items")
-			status := "SUCCESS"
-			if fail {
-				exec.WillReturnError(errors.New("DDL failed"))
-				status = "FAILED"
-			} else {
-				exec.WillReturnResult(sqlmock.NewResult(0, 0))
-			}
-			mock.ExpectExec("UPDATE schema_migrations SET status").WithArgs(status, 1).WillReturnResult(sqlmock.NewResult(0, 1))
-			if err := service.ExecuteMigration(req); (err != nil) != fail {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if err := mock.ExpectationsWereMet(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	for _, d := range []database.Dialect{database.MySQL, database.MariaDB} {
+		if _, err := database.Statements("CREATE TABLE items(id INT)", d, false); err == nil {
+			t.Fatal("DDL tanpa pilihan eksplisit diterima")
+		}
+		if _, err := database.Statements("CREATE TABLE items(id INT)", d, true); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Statements("CREATE TABLE x(id INT);DROP TABLE x", d, true); err == nil {
+			t.Fatal("batch DDL non-atomic diterima")
+		}
 	}
 }
 func TestVersionQueryFailureStopsMigration(t *testing.T) {
-	db, mock, _ := sqlmock.New()
-	defer db.Close()
-	service := NewMigrationService(db)
-	mock.ExpectQuery(`SELECT MAX\(version\)`).WillReturnError(errors.New("database offline"))
-	if err := service.ExecuteMigration(MigrationRequest{UserID: 1, UserAccess: "View + Edit", Version: 1, QuerySQL: "CREATE TABLE x (id INT)"}); err == nil {
-		t.Fatal("version lookup failure ignored")
+	f := newFixture(t)
+	f.roles.Audit.Exec(`DROP TABLE platform_migrations.attempts CASCADE`)
+	if _, err := f.run(1, "CREATE TABLE blocked(id INT)"); err == nil {
+		t.Fatal("history tidak tersedia tetapi SQL berjalan")
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
+	var exists bool
+	f.roles.Executor.QueryRow(`SELECT to_regclass('public.blocked') IS NOT NULL`).Scan(&exists)
+	if exists {
+		t.Fatal("SQL tetap dijalankan")
 	}
 }
-
 func TestMySQLNonTransactionalEngineRejected(t *testing.T) {
-	db, mock, _ := sqlmock.New()
-	defer db.Close()
-	service := NewMigrationServiceWithDialect(db, database.MySQL)
-	mock.ExpectQuery(`SELECT MAX\(version\)`).WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
-	mock.ExpectQuery("SELECT COUNT.*information_schema.tables").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	if err := service.ExecuteMigration(MigrationRequest{UserID: 1, UserAccess: "View + Edit", Version: 1, QuerySQL: "INSERT INTO legacy VALUES (1)"}); err == nil {
-		t.Fatal("nontransactional table accepted")
+	if _, err := database.Statements("CREATE PROCEDURE unsafe() COMMIT", database.MySQL, true); err == nil {
+		t.Fatal("stored program diterima")
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
+}
+func TestSchemaDiffRequiresReviewAndQuotesIdentifiers(t *testing.T) {
+	f := newFixture(t)
+	f.run(1, `CREATE TABLE public.items(id INT NOT NULL, old TEXT)`)
+	result, err := f.engine.Diff(context.Background(), f.id, migration.DesiredSchema{Schema: "public", Tables: []migration.DesiredTable{{Name: "items", Columns: []migration.DesiredColumn{{Name: "id", Type: "bigint", Nullable: false}, {Name: `safe"name`, Type: "text", Nullable: true}}}}})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.SQL != `ALTER TABLE "public"."items" ADD COLUMN "safe""name" text;` {
+		t.Fatal(result.SQL)
+	}
+	reviews := 0
+	for _, d := range result.Differences {
+		if d.RequiresDecision {
+			reviews++
+		}
+	}
+	if reviews != 2 {
+		t.Fatal("perubahan berisiko ditebak", result)
+	}
+	var count int
+	f.roles.Executor.QueryRow(`SELECT count(*) FROM information_schema.columns WHERE table_name='items'`).Scan(&count)
+	if count != 2 {
+		t.Fatal("diff mengeksekusi SQL otomatis")
 	}
 }

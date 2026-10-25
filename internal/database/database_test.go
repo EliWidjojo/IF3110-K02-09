@@ -1,101 +1,89 @@
-package database
+package database_test
 
 import (
+	"IF3110-K02-09/internal/database"
+	"IF3110-K02-09/internal/testutil"
+	"IF3110-K02-09/internal/viewer"
 	"context"
 	"errors"
-	"regexp"
 	"testing"
-
-	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestStatements(t *testing.T) {
 	for _, tc := range []struct {
 		name, sql string
-		dialect   Dialect
+		dialect   database.Dialect
 		ddl, ok   bool
 		count     int
 	}{
-		{"postgres multi", "CREATE TABLE t (x TEXT); INSERT INTO t VALUES ('a;b');", Postgres, false, true, 2},
-		{"dollar literal", "INSERT INTO t VALUES ($tag$a;b$tag$)", Postgres, false, true, 1},
-		{"quoted identifier", "CREATE TABLE \"a;b\" (x INT)", Postgres, false, true, 1},
-		{"comments", "/* header */ INSERT INTO t VALUES (1); -- tail", MySQL, false, true, 1},
-		{"transaction bypass", "INSERT INTO t VALUES (1); COMMIT;", Postgres, false, false, 0},
-		{"transaction bypass after quote", "INSERT INTO t VALUES ('a'';b'); COMMIT", Postgres, false, false, 0},
-		{"unclosed quote", "INSERT INTO t VALUES ('a)", Postgres, false, false, 0},
-		{"mysql implicit commit", "CREATE TABLE t (id INT)", MySQL, false, false, 0},
-		{"mysql explicit ddl", "CREATE TABLE t (id INT)", MySQL, true, true, 1},
-		{"maria explicit ddl", "ALTER TABLE t ADD x INT", MariaDB, true, true, 1},
-		{"mysql multiple ddl", "CREATE TABLE t (id INT); DROP TABLE t", MySQL, true, false, 0},
-		{"mysql executable comment", "INSERT INTO t VALUES (1) /*! ; COMMIT */", MySQL, false, false, 0},
-		{"procedure", "CREATE PROCEDURE foo() COMMIT", MySQL, true, false, 0},
-		{"empty", " -- no SQL", Postgres, false, false, 0},
+		{"postgres multi", "CREATE TABLE t (x TEXT); INSERT INTO t VALUES ('a;b');", database.Postgres, false, true, 2},
+		{"dollar literal", "INSERT INTO t VALUES ($tag$a;b$tag$)", database.Postgres, false, true, 1},
+		{"quoted identifier", "CREATE TABLE \"a;b\" (x INT)", database.Postgres, false, true, 1},
+		{"comments", "/* header */ INSERT INTO t VALUES (1); -- tail", database.MySQL, false, true, 1},
+		{"transaction bypass", "INSERT INTO t VALUES (1); COMMIT;", database.Postgres, false, false, 0},
+		{"transaction bypass after quote", "INSERT INTO t VALUES ('a'';b'); COMMIT", database.Postgres, false, false, 0},
+		{"unclosed quote", "INSERT INTO t VALUES ('a)", database.Postgres, false, false, 0},
+		{"mysql implicit commit", "CREATE TABLE t (id INT)", database.MySQL, false, false, 0},
+		{"mysql explicit ddl", "CREATE TABLE t (id INT)", database.MySQL, true, true, 1},
+		{"maria explicit ddl", "ALTER TABLE t ADD x INT", database.MariaDB, true, true, 1},
+		{"mysql multiple ddl", "CREATE TABLE t (id INT); DROP TABLE t", database.MySQL, true, false, 0},
+		{"mysql executable comment", "INSERT INTO t VALUES (1) /*! ; COMMIT */", database.MySQL, false, false, 0},
+		{"procedure", "CREATE PROCEDURE foo() COMMIT", database.MySQL, true, false, 0},
+		{"empty", " -- no SQL", database.Postgres, false, false, 0},
+		{"literal keyword", "INSERT INTO t VALUES ('function event trigger')", database.Postgres, false, true, 1},
+		{"mysql arithmetic", "INSERT INTO t VALUES (1--2)", database.MySQL, false, true, 1},
+		{"database DDL rejected", "DROP DATABASE target", database.MariaDB, true, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := Statements(tc.sql, tc.dialect, tc.ddl)
+			got, err := database.Statements(tc.sql, tc.dialect, tc.ddl)
 			if (err == nil) != tc.ok || tc.ok && len(got) != tc.count {
 				t.Fatalf("got %q, %v", got, err)
 			}
 		})
 	}
 }
+
 func TestQuotedIdentifiersAndReadOnlyPagination(t *testing.T) {
-	for _, dialect := range []Dialect{Postgres, MySQL, MariaDB} {
-		t.Run(string(dialect), func(t *testing.T) {
-			db, mock, err := sqlmock.New()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close()
-			target := Target{DB: db, Dialect: dialect}
-			name := "items`\";DROP TABLE users;--"
-			mock.ExpectBegin()
-			mock.ExpectQuery("SELECT COUNT").WithArgs("app", name).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-			query := "SELECT * FROM " + dialect.Quote("app") + "." + dialect.Quote(name) + " LIMIT " + dialect.Bind(1) + " OFFSET " + dialect.Bind(2)
-			mock.ExpectQuery(regexp.QuoteMeta(query)).WithArgs(25, 0).WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow([]byte("hello")))
-			mock.ExpectCommit()
-			result, err := target.Data(context.Background(), "app", name, 25, 0)
-			if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "hello" {
-				t.Fatalf("%+v %v", result, err)
-			}
-			if _, err := target.Data(context.Background(), "app", "items", 101, 0); err == nil {
-				t.Fatal("unbounded page accepted")
-			}
-			if err := mock.ExpectationsWereMet(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	p := testutil.NewPostgres(t)
+	roles := p.TargetRoles(t)
+	name := "items`\";DROP TABLE users;--"
+	quoted := database.Postgres.Quote(name)
+	if _, err := roles.Executor.Exec("CREATE TABLE " + quoted + "(id INT PRIMARY KEY,note TEXT); INSERT INTO " + quoted + " VALUES(1,'hello'),(2,'world')"); err != nil {
+		t.Fatal(err)
+	}
+	r := viewer.NewViewerMetadataRepository()
+	data, err := r.ReadTableData(context.Background(), roles.Executor, "public", name, viewer.ViewerPagination{Limit: 1, Offset: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Rows) != 1 || !data.HasMore || !data.StableOrder || data.Rows[0][0] != int64(1) {
+		t.Fatal("pagination/urutan tidak sesuai")
+	}
+	data, err = r.ReadTableData(context.Background(), roles.Executor, "public", name, viewer.ViewerPagination{Limit: 1, Offset: 1})
+	if err != nil || len(data.Rows) != 1 || data.HasMore || data.Rows[0][0] != int64(2) {
+		t.Fatal("halaman berikutnya salah", err)
+	}
+	if _, err = r.ReadTableData(context.Background(), roles.Executor, "public", name, viewer.ViewerPagination{Limit: 101}); !errors.Is(err, viewer.ErrInvalidViewerInput) {
+		t.Fatal("limit tidak dibatasi")
+	}
+	var count int
+	if roles.Executor.QueryRow("SELECT count(*) FROM "+quoted).Scan(&count) != nil || count != 2 {
+		t.Fatal("viewer mengubah data atau quoting gagal")
 	}
 }
 func TestMetadataAndDatabaseFailure(t *testing.T) {
-	for _, dialect := range []Dialect{Postgres, MySQL, MariaDB} {
-		t.Run(string(dialect), func(t *testing.T) {
-			db, mock, _ := sqlmock.New()
-			defer db.Close()
-			mock.MatchExpectationsInOrder(false)
-			for _, pattern := range []string{"SELECT schema_name", "SELECT table_schema, table_name, table_type", "SELECT table_schema, table_name, column_name", "SELECT table_schema, table_name, constraint_name"} {
-				mock.ExpectQuery(pattern).WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("example"))
-			}
-			index := "FROM pg_indexes"
-			if dialect.IsMySQL() {
-				index = "FROM information_schema.statistics"
-			}
-			mock.ExpectQuery(index).WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("index"))
-			target := Target{DB: db, Dialect: dialect}
-			result, err := target.Metadata(context.Background())
-			if err != nil || len(result) != 5 {
-				t.Fatalf("%v", err)
-			}
-			if err := mock.ExpectationsWereMet(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	p := testutil.NewPostgres(t)
+	roles := p.TargetRoles(t)
+	if _, err := roles.Executor.Exec("CREATE TABLE items(id INT PRIMARY KEY); CREATE INDEX items_id_index ON items(id)"); err != nil {
+		t.Fatal(err)
 	}
-	db, mock, _ := sqlmock.New()
-	defer db.Close()
-	mock.ExpectQuery("SELECT").WillReturnError(errors.New("connection lost"))
-	target := Target{DB: db, Dialect: Postgres}
-	if _, err := target.Metadata(context.Background()); err == nil {
-		t.Fatal("database failure ignored")
+	r := viewer.NewViewerMetadataRepository()
+	meta, err := r.GetTableMetadata(context.Background(), roles.Executor, "public", "items")
+	if err != nil || len(meta.Columns) != 1 || len(meta.Constraints) != 1 || len(meta.Indexes) != 2 {
+		t.Fatal("metadata tidak lengkap", err)
+	}
+	roles.Executor.Close()
+	if _, err = r.ListSchemas(context.Background(), roles.Executor); err == nil {
+		t.Fatal("kegagalan database ditelan")
 	}
 }

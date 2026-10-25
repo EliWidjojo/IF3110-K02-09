@@ -1,20 +1,13 @@
-[
-  {
-    "id": "postgres-demo",
-    "name": "PostgreSQL Demo",
-    "driver": "postgres",
-    "dsn": "postgres://platform:local-target-password@127.0.0.1:55432/platform_target?sslmode=disable"
-  },
-  {
-    "id": "mysql-demo",
-    "name": "MySQL Demo",
-    "driver": "mysql",
-    "dsn": "platform:local-target-password@tcp(127.0.0.1:53306)/platform_target"
-  },
-  {
-    "id": "mariadb-demo",
-    "name": "MariaDB Demo",
-    "driver": "mariadb",
-    "dsn": "platform:local-target-password@tcp(127.0.0.1:53307)/platform_target"
-  }
-]
+{
+  "name": "PostgreSQL lokal",
+  "driver": "postgres",
+  "host": "127.0.0.1",
+  "port": 55432,
+  "database_name": "atlas_target",
+  "username": "atlas_executor",
+  "password": "",
+  "audit_username": "atlas_audit",
+  "audit_password": "",
+  "ssl_mode": "disable",
+  "ssl_root_cert": ""
+}

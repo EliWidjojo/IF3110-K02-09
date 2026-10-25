@@ -190,3 +190,19 @@ func validUsername(username string) bool {
 	return username != "" && utf8.ValidString(username) && utf8.RuneCountInString(username) <= 128 &&
 		strings.TrimSpace(username) == username && strings.IndexFunc(username, unicode.IsControl) == -1
 }
+
+func (s *UserService) RevokeSessions(ctx context.Context, id int) error {
+	if err := s.requireAdmin(ctx); err != nil {
+		return err
+	}
+	store, ok := s.store.(interface {
+		InvalidateSessions(context.Context, int) error
+	})
+	if !ok || s.sessions == nil {
+		return ErrUserDependencyUnavailable
+	}
+	if err := store.InvalidateSessions(ctx, id); err != nil {
+		return err
+	}
+	return s.sessions.RevokeUserSessions(ctx, id)
+}

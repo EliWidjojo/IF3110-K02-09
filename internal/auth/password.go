@@ -49,3 +49,20 @@ func VerifyPassword(encoded, password string) bool {
 	got, err := pbkdf2.Key(sha256.New, password, salt, iterations, 32)
 	return err == nil && subtle.ConstantTimeCompare(got, want) == 1
 }
+
+func ValidPasswordHash(encoded string) bool {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" {
+		return false
+	}
+	iterations, err := strconv.Atoi(parts[1])
+	if err != nil || iterations < passwordIterations || iterations > 2000000 {
+		return false
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[2])
+	if err != nil || len(salt) != 16 {
+		return false
+	}
+	hash, err := base64.RawStdEncoding.DecodeString(parts[3])
+	return err == nil && len(hash) == 32
+}

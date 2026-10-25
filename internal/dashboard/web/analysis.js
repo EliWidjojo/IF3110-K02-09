@@ -20,16 +20,16 @@
   }
   async function run() {
     clear(); const ticket = generation, id = $("analysis-db").value;
-    if (!databases.some(db => String(db.database_id) === id && db.access_level === "View + Edit")) throw new Error("Pilih database dengan akses View + Edit.");
+    if (!databases.some(db => String(db.database_id) === id && db.access_level === "View + Edit" && db.driver === "postgres")) throw new Error("Pilih database dengan akses View + Edit.");
     const query = $("analysis-sql").value; if (new TextEncoder().encode(query).length > 12288) throw new Error("SQL maksimum 12 KiB.");
     controller = new AbortController(); $("analysis-status").textContent = "Menganalisis query…";
     try { const result = await app.api(`/api/viewer/databases/${encodeURIComponent(id)}/explain`, { method: "POST", body: { query, analyze: $("analysis-analyze").checked }, signal: controller.signal }); if (ticket !== generation) return; render(result); $("analysis-status").textContent = "Analisis selesai. Tidak ada migration yang dieksekusi atau dicatat."; }
     catch (error) { if (error.name !== "AbortError") { $("analysis-status").textContent = error.message; throw error; } }
   }
   document.addEventListener("DOMContentLoaded", () => { $("analysis-form").addEventListener("submit", event => { event.preventDefault(); app.action(run, event.submitter); }); $("analysis-db").addEventListener("change", clear); });
-  window.addEventListener("platform:databases", event => { databases = event.detail; app.options($("analysis-db"), databases.filter(db => db.access_level === "View + Edit"), db => db.database_id, db => db.name, "Pilih database dengan View + Edit"); clear(); });
+  window.addEventListener("platform:databases", event => { databases = event.detail; app.options($("analysis-db"), databases.filter(db => db.access_level === "View + Edit" && db.driver === "postgres"), db => db.database_id, db => db.name, "Pilih database dengan View + Edit"); clear(); });
   window.addEventListener("platform:invalidate", () => { clear(); databases = []; app.options($("analysis-db"), [], db => db.database_id, db => db.name, "Akses perlu diperiksa ulang"); });
   // Editor C mengirim SQL ke panel tanpa mengeksekusinya otomatis atau menyerahkan identitas pengguna melalui event.
-  window.PlatformAnalysis = { open({ databaseId, sql }) { app.show("analysis"); clear(); if (!databases.some(db => String(db.database_id) === String(databaseId) && db.access_level === "View + Edit")) { app.notice("Database editor tidak tersedia dengan akses View + Edit. Muat ulang akses.", true); return; } $("analysis-db").value = String(databaseId); $("analysis-sql").value = String(sql); $("analysis-analyze").checked = false; $("analysis-sql").focus(); } };
+  window.PlatformAnalysis = { open({ databaseId, sql }) { app.show("analysis"); clear(); if (!databases.some(db => String(db.database_id) === String(databaseId) && db.access_level === "View + Edit" && db.driver === "postgres")) { app.notice("Database editor tidak tersedia dengan akses View + Edit. Muat ulang akses.", true); return; } $("analysis-db").value = String(databaseId); $("analysis-sql").value = String(sql); $("analysis-analyze").checked = false; $("analysis-sql").focus(); } };
   window.addEventListener("platform:analyze", event => { if (event.detail && typeof event.detail.sql === "string") window.PlatformAnalysis.open(event.detail); });
 })();

@@ -82,7 +82,8 @@ func (h *DatabaseConnectionHandler) HandleDatabases(w http.ResponseWriter, r *ht
 	}
 	var body struct {
 		CreateDatabaseConnectionParams
-		Password databasePasswordInput `json:"password"`
+		Password      databasePasswordInput `json:"password"`
+		AuditPassword databasePasswordInput `json:"audit_password"`
 	}
 	if !httpapi.DecodeJSON(w, r, &body) {
 		return
@@ -93,6 +94,7 @@ func (h *DatabaseConnectionHandler) HandleDatabases(w http.ResponseWriter, r *ht
 	}
 	params := body.CreateDatabaseConnectionParams
 	params.Password = body.Password.value
+	params.AuditPassword = body.AuditPassword.value
 	connection, err := h.service.Create(r.Context(), params)
 	if err != nil {
 		writeDatabaseConnectionError(w, err)
@@ -126,12 +128,16 @@ func (h *DatabaseConnectionHandler) HandleDatabase(w http.ResponseWriter, r *htt
 	case http.MethodPatch:
 		var body struct {
 			UpdateDatabaseConnectionParams
-			Password databasePasswordInput `json:"password"`
+			Password      databasePasswordInput `json:"password"`
+			AuditPassword databasePasswordInput `json:"audit_password"`
 		}
 		if !httpapi.DecodeJSON(w, r, &body) {
 			return
 		}
 		params := body.UpdateDatabaseConnectionParams
+		if body.AuditPassword.provided {
+			params.AuditPassword = &body.AuditPassword.value
+		}
 		if body.Password.provided {
 			params.Password = &body.Password.value
 		}
@@ -235,6 +241,8 @@ func writeDatabaseConnectionError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	apiError := &httpapi.Error{Code: "internal_error", Message: "operasi konfigurasi database gagal"}
 	switch {
+	case errors.Is(err, ErrInternalDatabaseTarget):
+		status, apiError = http.StatusBadRequest, &httpapi.Error{Code: "internal_database_target", Message: ErrInternalDatabaseTarget.Error()}
 	case errors.Is(err, admin.ErrUnauthenticated), errors.Is(err, admin.ErrPlatformAdminRequired), errors.Is(err, admin.ErrInvalidUserCSRF):
 		admin.WriteUserServiceError(w, err)
 		return

@@ -44,6 +44,9 @@ func RegisterDashboardRoutes(mux *http.ServeMux) {
 		case "/platform/assets/viewer.js":
 			name = "viewer.js"
 			contentType = "text/javascript; charset=utf-8"
+		case "/platform/assets/migrations.js":
+			name = "migrations.js"
+			contentType = "text/javascript; charset=utf-8"
 		case "/platform/assets/analysis.js":
 			name = "analysis.js"
 			contentType = "text/javascript; charset=utf-8"
