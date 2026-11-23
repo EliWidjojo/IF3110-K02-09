@@ -14,7 +14,7 @@ import (
 func TestMariaDBCompleteFlow(t *testing.T) {
 	f := fixture(t)
 	m := testutil.NewMySQL(t)
-	if err := migration.SetupMySQLHistory(context.Background(), m.Audit, m.Name, m.ExecutorName+"@localhost"); err != nil {
+	if err := migration.SetupMySQLHistory(context.Background(), m.Audit, m.Name, m.ExecutorName+"@"+m.AccountHost); err != nil {
 		t.Fatal("setup history MariaDB", err)
 	}
 	config := map[string]any{"name": "mariadb", "driver": "mariadb", "host": m.Host, "port": m.Port, "database_name": m.Name, "username": m.ExecutorName, "password": m.Password, "audit_username": m.AuditName, "audit_password": m.AuditPassword, "ssl_mode": "disable"}

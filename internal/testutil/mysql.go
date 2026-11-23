@@ -19,6 +19,7 @@ type MySQL struct {
 	Name, Host                                                string
 	Port                                                      int
 	ExecutorName, AuditName, Password, AuditPassword, History string
+	AccountHost                                               string
 }
 
 func NewMySQL(t *testing.T) *MySQL {
@@ -44,11 +45,17 @@ func NewMySQL(t *testing.T) *MySQL {
 		t.Fatal("MariaDB test tidak dapat dihubungi")
 	}
 	p := &MySQL{Name: "atlas_test_" + token(), Host: host, ExecutorName: "ae_" + token(), AuditName: "aa_" + token(), Password: token() + token(), AuditPassword: token() + token()}
+	// Docker NAT can make a localhost DSN arrive from a bridge address.
+	if err := admin.QueryRow(`SELECT SUBSTRING_INDEX(USER(),'@',-1)`).Scan(&p.AccountHost); err != nil || p.AccountHost == "" {
+		admin.Close()
+		t.Fatal("alamat client MariaDB test tidak dapat ditentukan")
+	}
 	p.Port, _ = strconv.Atoi(port)
 	sum := sha256.Sum256([]byte(p.Name))
 	p.History = "atlas_history_" + hex.EncodeToString(sum[:8])
 	quote := func(x string) string { return "`" + strings.ReplaceAll(x, "`", "``") + "`" }
 	literal := func(x string) string { return "'" + strings.ReplaceAll(x, "'", "''") + "'" }
+	account := func(name string) string { return literal(name) + "@" + literal(p.AccountHost) }
 	t.Cleanup(func() {
 		if p.Executor != nil {
 			p.Executor.Close()
@@ -59,14 +66,14 @@ func NewMySQL(t *testing.T) *MySQL {
 		if p.DB != nil {
 			p.DB.Close()
 		}
-		for _, q := range []string{"DROP DATABASE IF EXISTS " + quote(p.Name), "DROP DATABASE IF EXISTS " + quote(p.History), "DROP USER IF EXISTS " + literal(p.ExecutorName) + "@'localhost'", "DROP USER IF EXISTS " + literal(p.AuditName) + "@'localhost'"} {
+		for _, q := range []string{"DROP DATABASE IF EXISTS " + quote(p.Name), "DROP DATABASE IF EXISTS " + quote(p.History), "DROP USER IF EXISTS " + account(p.ExecutorName), "DROP USER IF EXISTS " + account(p.AuditName)} {
 			if _, e := admin.Exec(q); e != nil {
 				t.Error("pembersihan MariaDB test gagal")
 			}
 		}
 		admin.Close()
 	})
-	queries := []string{"CREATE DATABASE " + quote(p.Name), "CREATE DATABASE " + quote(p.History), "CREATE USER " + literal(p.ExecutorName) + "@'localhost' IDENTIFIED BY " + literal(p.Password), "CREATE USER " + literal(p.AuditName) + "@'localhost' IDENTIFIED BY " + literal(p.AuditPassword), "GRANT ALL ON " + quote(p.Name) + ".* TO " + literal(p.ExecutorName) + "@'localhost'", "GRANT ALL ON " + quote(p.History) + ".* TO " + literal(p.AuditName) + "@'localhost' WITH GRANT OPTION"}
+	queries := []string{"CREATE DATABASE " + quote(p.Name), "CREATE DATABASE " + quote(p.History), "CREATE USER " + account(p.ExecutorName) + " IDENTIFIED BY " + literal(p.Password), "CREATE USER " + account(p.AuditName) + " IDENTIFIED BY " + literal(p.AuditPassword), "GRANT ALL ON " + quote(p.Name) + ".* TO " + account(p.ExecutorName), "GRANT ALL ON " + quote(p.History) + ".* TO " + account(p.AuditName) + " WITH GRANT OPTION"}
 	for _, q := range queries {
 		if _, err = admin.Exec(q); err != nil {
 			t.Fatal("setup privilege MariaDB test gagal")

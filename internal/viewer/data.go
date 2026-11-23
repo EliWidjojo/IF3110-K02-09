@@ -15,6 +15,8 @@ import (
 	"github.com/lib/pq"
 )
 
+// Model, pagination, dan repository pembacaan data tabel.
+
 const (
 	ViewerMaxResultBytes  = 2 * 1024 * 1024
 	ViewerDefaultPageSize = 50

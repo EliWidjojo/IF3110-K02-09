@@ -4,6 +4,8 @@
 
 Atlas adalah platform administrasi database untuk mengelola koneksi, memberikan akses melalui group, menjelajahi schema dan data, serta menjalankan migration SQL dengan pencatatan riwayat. Backend Go menyajikan HTML, CSS bersama, dan vanilla JavaScript tanpa framework frontend.
 
+Persiapan demonstrasi: [panduan teknis auth, security, migration, query plan, dan pengujian](docs/PANDUAN_DEMO_AUTH_SECURITY.md), termasuk skenario manual, expected status, pemetaan automated test, dan latihan jawaban lisan. Gunakan juga [bank 50 pertanyaan dan skenario demo berdasarkan spesifikasi milestone](docs/BANK_PERTANYAAN_DEMO_MILESTONE_1.md) untuk latihan tanya jawab teknis.
+
 Database PostgreSQL internal menyimpan identitas, group, keanggotaan, grant, dan konfigurasi koneksi. Database target menyimpan data aplikasi serta history migration yang dilindungi privilege terpisah. Dukungan utama memakai PostgreSQL; MariaDB, analisis execution plan PostgreSQL, dan schema diff tersedia dengan batas yang dijelaskan di bawah.
 
 ## Daftar isi
@@ -564,6 +566,33 @@ scripts/                Generator environment dan init database
 config/                 Contoh konfigurasi koneksi
 screenshots/            Screenshot asli aplikasi untuk README
 ```
+
+File authentication, administrasi, dan viewer dikelompokkan berdasarkan fitur agar fungsi yang berkaitan dapat ditelusuri di satu tempat:
+
+| File | Isi |
+| --- | --- |
+| `internal/auth/auth.go` | Model dan repository identitas, bootstrap admin, login/logout, cookie, CSRF, serta middleware HTTP. |
+| `internal/auth/session.go` | Pembuatan, kedaluwarsa, rotasi, dan pencabutan session. |
+| `internal/auth/password.go` | Hashing dan verifikasi password. |
+| `internal/admin/user.go` | Model, service, validasi, dan repository user. |
+| `internal/admin/user_handler.go` | Endpoint HTTP administrasi user. |
+| `internal/admin/group.go` | Model, service, validasi, dan repository group beserta keanggotaannya. |
+| `internal/admin/group_handler.go` | Endpoint HTTP group dan keanggotaan. |
+| `internal/admin/authentication_repository.go` | Pembacaan identitas dan hash untuk authentication. |
+| `internal/access/grants.go` | Model, handler HTTP, service, dan repository izin group terhadap database. |
+| `internal/access/effective.go` | Model, service, dan repository perhitungan akses efektif pengguna. |
+| `internal/database/connection.go` | Model, service, dan repository konfigurasi serta kredensial koneksi. |
+| `internal/database/connection_handler.go` | Endpoint HTTP administrasi koneksi. |
+| `internal/database/connector.go` | Pembentukan koneksi target dan klasifikasi error yang aman. |
+| `internal/database/pool.go` | Siklus hidup, penggunaan ulang, dan invalidasi pool target. |
+| `internal/database/password_cipher.go` | Enkripsi dan dekripsi kredensial. |
+| `internal/database/database.go` | Dialect, konfigurasi legacy, dan penamaan schema history. |
+| `internal/database/statements.go` | Pemisahan statement SQL sesuai dialect. |
+| `internal/viewer/handler.go` | Seluruh endpoint viewer, respons metadata, pagination request, dan serialisasi data. |
+| `internal/viewer/service.go` | Pemeriksaan akses, timeout, dan koordinasi operasi viewer. |
+| `internal/viewer/metadata.go` | Model dan repository schema, tabel, kolom, constraint, serta index PostgreSQL. |
+| `internal/viewer/data.go` | Model, batas pagination, dan repository pembacaan data tabel PostgreSQL. |
+| `internal/viewer/mysql.go` | Implementasi pembacaan metadata dan data MariaDB/MySQL. |
 
 ## Identitas kelompok
 
