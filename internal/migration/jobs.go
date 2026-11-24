@@ -17,13 +17,13 @@ import (
 	"IF3110-K02-09/internal/httpapi"
 )
 
-// QUEUED hanya berarti pengajuan tersimpan. Worker kelak wajib memeriksa
-// approval, revision, izin terbaru, dan lock target sebelum mengeksekusinya.
+// QUEUED menyimpan snapshot sambil menunggu persetujuan dan klaim worker.
 type JobStatus string
 
 const (
 	JobQueued      JobStatus = "QUEUED"
 	JobRunning     JobStatus = "RUNNING"
+	JobPartial     JobStatus = "PARTIAL"
 	JobReady       JobStatus = "READY"
 	JobSuccess     JobStatus = "SUCCESS"
 	JobFailed      JobStatus = "FAILED"
@@ -39,27 +39,34 @@ var (
 // JobSubmission merupakan snapshot input, bukan referensi ke revision yang dapat berubah.
 // Identitas pengaju, status, dan worker selalu ditetapkan backend.
 type JobSubmission struct {
+	BatchSize    int    `json:"batch_size,omitempty"`
+	DownSQL      string `json:"down_sql,omitempty"`
+	Operation    string `json:"operation,omitempty"`
+	SourceJob    int64  `json:"source_job,omitempty"`
 	Version      int    `json:"version"`
 	QuerySQL     string `json:"query_sql"`
 	NonAtomicDDL bool   `json:"non_atomic_ddl"`
 }
 
 type Job struct {
-	ID          int64            `json:"id"`
-	DatabaseID  int              `json:"database_id"`
-	SubmittedBy int              `json:"submitted_by"`
-	Submission  JobSubmission    `json:"submission"`
-	Driver      database.Dialect `json:"driver"`
-	Status      JobStatus        `json:"status"`
-	WorkerID    *string          `json:"worker_id"`
-	HeartbeatAt *time.Time       `json:"heartbeat_at"`
-	LeaseUntil  *time.Time       `json:"lease_until"`
-	CreatedAt   time.Time        `json:"created_at"`
-	UpdatedAt   time.Time        `json:"updated_at"`
-	StartedAt   *time.Time       `json:"started_at"`
-	FinishedAt  *time.Time       `json:"finished_at"`
-	ErrorCode   string           `json:"error_code"`
-	StatusURL   string           `json:"status_url"`
+	AttemptID        *int64           `json:"attempt_id"`
+	CommittedBatches int64            `json:"committed_batches"`
+	CommittedRows    int64            `json:"committed_rows"`
+	ID               int64            `json:"id"`
+	DatabaseID       int              `json:"database_id"`
+	SubmittedBy      int              `json:"submitted_by"`
+	Submission       JobSubmission    `json:"submission"`
+	Driver           database.Dialect `json:"driver"`
+	Status           JobStatus        `json:"status"`
+	WorkerID         *string          `json:"worker_id"`
+	HeartbeatAt      *time.Time       `json:"heartbeat_at"`
+	LeaseUntil       *time.Time       `json:"lease_until"`
+	CreatedAt        time.Time        `json:"created_at"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+	StartedAt        *time.Time       `json:"started_at"`
+	FinishedAt       *time.Time       `json:"finished_at"`
+	ErrorCode        string           `json:"error_code"`
+	StatusURL        string           `json:"status_url"`
 }
 
 type jobConfiguration interface {
@@ -91,6 +98,15 @@ func ValidateSubmission(ctx context.Context, req JobSubmission, driver database.
 	if req.Version <= 0 || req.Version > 2147483647 || len(req.QuerySQL) > 12288 || !utf8.ValidString(req.QuerySQL) || strings.ContainsRune(req.QuerySQL, 0) {
 		return &InputError{"versi atau ukuran/encoding SQL tidak valid (maksimum 12 KiB)"}
 	}
+	if req.BatchSize < 0 || req.BatchSize > 100000 || (req.BatchSize > 0 && (driver != database.Postgres || batchUpdate.FindStringSubmatch(req.QuerySQL) == nil || req.DownSQL != "")) {
+		return &InputError{"batch memerlukan PostgreSQL, ukuran 1-100000, dan UPDATE public.tabel SET kolom = TRUE atau FALSE"}
+	}
+	if req.DownSQL != "" {
+		down := JobSubmission{Version: req.Version, QuerySQL: req.DownSQL, NonAtomicDDL: req.NonAtomicDDL}
+		if err := ValidateSubmission(ctx, down, driver, key); err != nil {
+			return err
+		}
+	}
 	if _, err := database.Statements(req.QuerySQL, driver, req.NonAtomicDDL); err != nil {
 		return errors.Join(ErrInvalidMigration, err)
 	}
@@ -119,6 +135,30 @@ func (s *JobService) SubmitJob(ctx context.Context, databaseID int, key string, 
 	if err != nil {
 		return Job{}, err
 	}
+	if req.Operation == "" {
+		req.Operation = "apply"
+	}
+	switch req.Operation {
+	case "apply":
+		if req.SourceJob != 0 {
+			return Job{}, &InputError{"source_job hanya untuk rollback atau forward"}
+		}
+	case "rollback", "forward":
+		if req.SourceJob <= 0 || req.QuerySQL != "" || req.DownSQL != "" || req.BatchSize != 0 || req.NonAtomicDDL {
+			return Job{}, &InputError{"gunakan source_job dan versi eksekusi baru"}
+		}
+		source, err := s.GetJob(ctx, databaseID, req.SourceJob)
+		if err != nil {
+			return Job{}, err
+		}
+		if source.Status != JobSuccess || source.Submission.DownSQL == "" || source.Submission.BatchSize != 0 || (req.Operation == "forward") != (source.Submission.Operation == "rollback") {
+			return Job{}, &InputError{"sumber tidak mendukung operasi ini"}
+		}
+		req.QuerySQL, req.DownSQL = source.Submission.DownSQL, source.Submission.QuerySQL
+		req.NonAtomicDDL = source.Submission.NonAtomicDDL
+	default:
+		return Job{}, &InputError{"operation tidak valid"}
+	}
 	if err = ValidateSubmission(ctx, req, cfg.Driver, key); err != nil {
 		return Job{}, err
 	}
@@ -126,23 +166,23 @@ func (s *JobService) SubmitJob(ctx context.Context, databaseID int, key string, 
 }
 
 const jobColumns = `id, database_id, submitted_by, version, query_sql, non_atomic_ddl,
-	driver, status, worker_id, created_at, updated_at, started_at, finished_at, error_code, heartbeat_at, lease_until`
+	driver, status, worker_id, created_at, updated_at, started_at, finished_at, error_code, heartbeat_at, lease_until, batch_size, down_sql, operation, source_job, attempt_id, committed_batches, committed_rows`
 
 func scanJob(row interface{ Scan(...any) error }) (Job, error) {
 	var j Job
 	err := row.Scan(&j.ID, &j.DatabaseID, &j.SubmittedBy, &j.Submission.Version,
 		&j.Submission.QuerySQL, &j.Submission.NonAtomicDDL, &j.Driver, &j.Status,
-		&j.WorkerID, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt, &j.ErrorCode, &j.HeartbeatAt, &j.LeaseUntil)
+		&j.WorkerID, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt, &j.ErrorCode, &j.HeartbeatAt, &j.LeaseUntil, &j.Submission.BatchSize, &j.Submission.DownSQL, &j.Submission.Operation, &j.Submission.SourceJob, &j.AttemptID, &j.CommittedBatches, &j.CommittedRows)
 	j.StatusURL = fmt.Sprintf("/api/databases/%d/migrations/jobs/%d", j.DatabaseID, j.ID)
 	return j, err
 }
 
 func (s *JobService) createJob(ctx context.Context, databaseID, actor int, key string, req JobSubmission, driver database.Dialect) (Job, error) {
 	j, err := scanJob(s.db.QueryRowContext(ctx, `INSERT INTO platform.migration_jobs
-		(database_id, submitted_by, idempotency_key, version, query_sql, non_atomic_ddl, driver)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		(database_id, submitted_by, idempotency_key, version, query_sql, non_atomic_ddl, driver, batch_size,down_sql,operation,source_job)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		ON CONFLICT (database_id, submitted_by, idempotency_key) DO NOTHING
-		RETURNING `+jobColumns, databaseID, actor, key, req.Version, req.QuerySQL, req.NonAtomicDDL, driver))
+		RETURNING `+jobColumns, databaseID, actor, key, req.Version, req.QuerySQL, req.NonAtomicDDL, driver, req.BatchSize, req.DownSQL, req.Operation, req.SourceJob))
 	if errors.Is(err, sql.ErrNoRows) {
 		// Statement terpisah memperoleh snapshot baru setelah INSERT paralel selesai.
 		// Tidak memakai DO UPDATE agar retry tidak mengubah job/status/timestamp lama.
@@ -190,6 +230,7 @@ func NewJobHandler(service *JobService, csrf admin.UserCSRFVerifier) *JobHandler
 
 func RegisterJobRoutes(mux *http.ServeMux, h *JobHandler) {
 	mux.HandleFunc("PUT /api/databases/{database_id}/migrations/jobs/{job_id}/approvals/{group_id}", h.HandleApprove)
+	mux.HandleFunc("POST /api/databases/{database_id}/migrations/execute", h.HandleSubmitJob)
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/jobs", h.HandleSubmitJob)
 	mux.HandleFunc("GET /api/databases/{database_id}/migrations/jobs/{job_id}", h.HandleGetJob)
 }
@@ -242,6 +283,10 @@ func (h *JobHandler) HandleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	databaseID, err := jobDatabaseID(r)
 	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	if err := h.service.access.RequireEdit(r.Context(), databaseID); err != nil {
 		writeJobError(w, err)
 		return
 	}

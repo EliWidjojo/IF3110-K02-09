@@ -13,7 +13,7 @@ import (
 )
 
 // A claim token identifies one acquisition, even if two processes share a worker name.
-// Only preflight work can be reclaimed here. Execution will need outcome reconciliation.
+// A reclaimed job with an attempt ID is reconciled against target history.
 var ErrLeaseLost = errors.New("lease job sudah berakhir")
 
 type Worker struct {
@@ -42,7 +42,7 @@ func (w *Worker) claim(ctx context.Context) (claim, error) {
 	token := hex.EncodeToString(secret[:])
 	j, err := scanJob(w.db.QueryRowContext(ctx, `WITH candidate AS (
 	 SELECT j.id FROM platform.migration_jobs j JOIN platform.job_admission a ON a.id=j.id
-	 WHERE (j.status='QUEUED' AND a.approved) OR
+	 WHERE (j.status IN ('QUEUED','READY') AND a.approved) OR
 	       (j.status='RUNNING' AND j.lease_token IS NOT NULL AND j.lease_until <= clock_timestamp())
 	 ORDER BY j.updated_at,j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1
 	)
@@ -72,10 +72,9 @@ func checkOwner(res sql.Result, err error) error {
 	return err
 }
 
-// ProcessNext performs one preflight. The physical lock stays held through the
-// guarded READY write; READY records a check, never an authorization to execute later.
+// ProcessNext claims one approved job and keeps its lease alive through execution.
 func (w *Worker) ProcessNext(ctx context.Context) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c, err := w.claim(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -101,13 +100,13 @@ func (w *Worker) ProcessNext(ctx context.Context) (bool, error) {
 			}
 		}
 	}()
-	err = w.preflight(ctx, c)
+	err = w.process(ctx, c)
 	cancel()
 	<-done
 	return true, err
 }
 
-func (w *Worker) preflight(ctx context.Context, c claim) error {
+func (w *Worker) process(ctx context.Context, c claim) error {
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -120,7 +119,7 @@ func (w *Worker) preflight(ctx context.Context, c claim) error {
 	}
 	finish := func(status JobStatus, code string) error {
 		res, err := tx.ExecContext(ctx, `UPDATE platform.migration_jobs SET status=$3,error_code=$4,
-		 lease_token=NULL,lease_until=NULL,finished_at=CASE WHEN $3='FAILED' THEN clock_timestamp() ELSE NULL END
+		 lease_token=NULL,lease_until=NULL,finished_at=CASE WHEN $3 IN ('FAILED','SUCCESS','PARTIAL','NEEDS_REVIEW') THEN clock_timestamp() ELSE NULL END
 		 WHERE `+ownsLease, c.job.ID, c.token, status, code)
 		if err = checkOwner(res, err); err != nil {
 			return err
@@ -142,13 +141,13 @@ func (w *Worker) preflight(ctx context.Context, c claim) error {
 	}
 	if code, err := admission(); err != nil {
 		return err
-	} else if code != "" {
+	} else if code != "" && (c.job.AttemptID == nil || code == "target_changed") {
 		return check(code)
 	}
 	if err = ValidateSubmission(ctx, c.job.Submission, c.job.Driver, "preflight"); err != nil {
 		return finish(JobFailed, "invalid_revision")
 	}
-	// Each preflight opens fresh pools. A pool cached in another process cannot
+	// Each job opens fresh pools. A pool cached in another process cannot
 	// be invalidated by the administration service after a configuration change.
 	pools, err := database.NewTargetConnectionManager(w.repo, database.TargetPoolOptions{})
 	if err != nil {
@@ -185,6 +184,30 @@ func (w *Worker) preflight(ctx context.Context, c claim) error {
 		return finish(JobFailed, "unsafe_target")
 	}
 	schema := cfg.Driver.Quote(HistorySchema(cfg.Driver, cfg.DatabaseName))
+	reconcile := func() error {
+		var state string
+		if err := control.QueryRowContext(ctx, "SELECT status FROM "+schema+".attempts WHERE id="+cfg.Driver.Bind(1), *c.job.AttemptID).Scan(&state); err != nil {
+			return finish(JobNeedsReview, "outcome_unknown")
+		}
+		if c.job.Submission.BatchSize > 0 {
+			if err = w.syncProgress(ctx, &c, control, *c.job.AttemptID); err != nil {
+				return finish(JobNeedsReview, "checkpoint_unavailable")
+			}
+		}
+		switch state {
+		case "SUCCESS":
+			return finish(JobSuccess, "")
+		case "FAILED":
+			return finish(JobFailed, "sql_failed")
+		}
+		if c.job.Submission.BatchSize > 0 && c.job.CommittedBatches > 0 {
+			return finish(JobPartial, "interrupted")
+		}
+		return finish(JobNeedsReview, "outcome_unknown")
+	}
+	if c.job.AttemptID != nil {
+		return reconcile()
+	}
 	var latest, unresolved int
 	if err = control.QueryRowContext(ctx, "SELECT COALESCE(MAX(CASE WHEN status='SUCCESS' THEN version END),0),COUNT(CASE WHEN status IN ('RUNNING','NEEDS_REVIEW') THEN 1 END) FROM "+schema+".attempts").Scan(&latest, &unresolved); err != nil {
 		return finish(JobFailed, "history_unavailable")
@@ -214,5 +237,48 @@ func (w *Worker) preflight(ctx context.Context, c claim) error {
 	} else if code != "" {
 		return check(code)
 	}
-	return finish(JobReady, "")
+	if c.job.Submission.SourceJob != 0 {
+		var matches bool
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM platform.migration_jobs src JOIN platform.migration_jobs j ON j.source_job=src.id
+    WHERE j.id=$1 AND j.target_version=src.target_version AND j.database_id=src.database_id AND src.status='SUCCESS' AND src.version=$2)`, c.job.ID, latest).Scan(&matches)
+		if err != nil {
+			return err
+		}
+		if !matches {
+			return finish(JobFailed, "source_not_current")
+		}
+	}
+	req := MigrationRequest{Version: c.job.Submission.Version, QuerySQL: c.job.Submission.QuerySQL, NonAtomicDDL: c.job.Submission.NonAtomicDDL}
+	statements, err := database.Statements(req.QuerySQL, cfg.Driver, req.NonAtomicDDL)
+	if err != nil {
+		return finish(JobFailed, "invalid_revision")
+	}
+	if err = w.heartbeat(ctx, c); err != nil {
+		return err
+	}
+	start := func(id int64) error {
+		res, err := w.db.ExecContext(ctx, `UPDATE platform.migration_jobs SET attempt_id=$3 WHERE `+ownsLease, c.job.ID, c.token, id)
+		if err = checkOwner(res, err); err != nil {
+			return err
+		}
+		c.job.AttemptID = &id
+		return nil
+	}
+	var batch func(string, int64) error
+	if c.job.Submission.BatchSize > 0 {
+		batch = func(token string, id int64) error { return w.runBatch(ctx, c, target, control, token, id) }
+	}
+	result, err := executeLocked(ctx, target, control, cfg, c.job.SubmittedBy, req, statements, latest, start, batch)
+	switch {
+	case err == nil:
+		return finish(JobSuccess, "")
+	case errors.Is(err, errPartial):
+		return finish(JobPartial, "batch_failed")
+	case errors.Is(err, ErrOutcomeUnknown) && c.job.AttemptID != nil:
+		return reconcile()
+	case errors.Is(err, ErrOutcomeUnknown) || result.Status == "NEEDS_REVIEW":
+		return finish(JobNeedsReview, "outcome_unknown")
+	default:
+		return finish(JobFailed, "execution_failed")
+	}
 }

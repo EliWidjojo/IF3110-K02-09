@@ -123,12 +123,19 @@ CREATE TRIGGER track_target_change BEFORE UPDATE ON platform.database_connection
 
 ALTER TABLE platform.migration_jobs
  ADD COLUMN IF NOT EXISTS target_version BIGINT,
+ ADD COLUMN IF NOT EXISTS batch_size INT NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS down_sql TEXT NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'apply',
+ ADD COLUMN IF NOT EXISTS source_job BIGINT NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS attempt_id BIGINT,
+ ADD COLUMN IF NOT EXISTS committed_batches BIGINT NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS committed_rows BIGINT NOT NULL DEFAULT 0,
  ADD COLUMN IF NOT EXISTS lease_token TEXT,
  ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
  ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
 ALTER TABLE platform.migration_jobs DROP CONSTRAINT IF EXISTS migration_jobs_status_check;
 ALTER TABLE platform.migration_jobs ADD CONSTRAINT migration_jobs_status_check
- CHECK (status IN ('QUEUED','RUNNING','READY','SUCCESS','FAILED','NEEDS_REVIEW'));
+ CHECK (status IN ('QUEUED','RUNNING','READY','PARTIAL','SUCCESS','FAILED','NEEDS_REVIEW'));
 -- Existing jobs intentionally retain NULL: their original destination cannot be reconstructed.
 CREATE OR REPLACE FUNCTION platform.capture_job_target() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -166,10 +173,10 @@ CREATE OR REPLACE VIEW platform.job_admission AS
 CREATE OR REPLACE FUNCTION platform.preserve_job_submission() RETURNS trigger LANGUAGE plpgsql AS $body$
 BEGIN
  IF ROW(OLD.id, OLD.database_id, OLD.submitted_by, OLD.idempotency_key, OLD.version,
-        OLD.query_sql, OLD.non_atomic_ddl, OLD.driver, OLD.created_at, OLD.target_version)
+        OLD.query_sql, OLD.non_atomic_ddl, OLD.driver, OLD.created_at, OLD.target_version, OLD.batch_size, OLD.down_sql, OLD.operation, OLD.source_job)
     IS DISTINCT FROM
     ROW(NEW.id, NEW.database_id, NEW.submitted_by, NEW.idempotency_key, NEW.version,
-        NEW.query_sql, NEW.non_atomic_ddl, NEW.driver, NEW.created_at, NEW.target_version) THEN
+        NEW.query_sql, NEW.non_atomic_ddl, NEW.driver, NEW.created_at, NEW.target_version, NEW.batch_size, NEW.down_sql, NEW.operation, NEW.source_job) THEN
   RAISE EXCEPTION 'job submission is immutable';
  END IF;
  NEW.updated_at = clock_timestamp();

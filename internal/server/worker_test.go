@@ -24,7 +24,7 @@ func TestWorkerAdmissionIntegration(t *testing.T) {
 	}
 	base := fmt.Sprintf("/api/databases/%d/migrations/jobs", f.databaseID)
 	submit := func(key string) int {
-		w := alice.request("POST", base, `{"version":1,"query_sql":"CREATE TABLE preflight_only(id int)"}`, map[string]string{"Idempotency-Key": key})
+		w := alice.request("POST", base, fmt.Sprintf(`{"version":%d,"query_sql":"CREATE TABLE preflight_%s(id int)"}`, map[string]int{"preflight": 1, "lease": 2, "changed": 3, "revoked": 4}[key], key), map[string]string{"Idempotency-Key": key})
 		status(t, w, 202)
 		return objectID(t, w)
 	}
@@ -82,12 +82,24 @@ func TestWorkerAdmissionIntegration(t *testing.T) {
 		}
 		return p.Data
 	}
-	if j := detail(id); j.Status != migration.JobReady || j.WorkerID == nil || j.HeartbeatAt == nil || j.LeaseUntil != nil {
+	if j := detail(id); j.Status != migration.JobSuccess || j.WorkerID == nil || j.HeartbeatAt == nil || j.LeaseUntil != nil {
 		t.Fatalf("preflight: %+v", j)
 	}
 	var absent bool
-	if err := f.target.DB.QueryRow("SELECT to_regclass('public.preflight_only') IS NULL").Scan(&absent); err != nil || !absent {
-		t.Fatal("unexpected execution", err)
+	if err := f.target.DB.QueryRow("SELECT to_regclass('public.preflight_preflight') IS NULL").Scan(&absent); err != nil || absent {
+		t.Fatal("approved migration did not execute", err)
+	}
+	// Model a target commit followed by a crash before the platform recorded SUCCESS.
+	if _, err := f.internal.DB.Exec(`UPDATE platform.migration_jobs SET status='RUNNING', lease_token='expired',
+		lease_until=clock_timestamp()-interval '1 second',finished_at=NULL WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := two.ProcessNext(ctx); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	var attempts int
+	if err := f.roles.Audit.QueryRow("SELECT count(*) FROM platform_migrations.attempts WHERE version=1").Scan(&attempts); err != nil || attempts != 1 || detail(id).Status != migration.JobSuccess {
+		t.Fatal("commit was not reconciled", attempts, err)
 	}
 
 	// Hold the same physical lock as synchronous migration, observe renewal,
@@ -137,7 +149,7 @@ func TestWorkerAdmissionIntegration(t *testing.T) {
 	if err = <-second; err != nil {
 		t.Fatal(err)
 	}
-	if j := detail(id); j.Status != migration.JobReady || j.WorkerID == nil || *j.WorkerID != "two" {
+	if j := detail(id); j.Status != migration.JobSuccess || j.WorkerID == nil || *j.WorkerID != "two" {
 		t.Fatalf("reclaimed: %+v", j)
 	}
 

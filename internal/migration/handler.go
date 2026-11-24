@@ -17,7 +17,6 @@ type Handler struct {
 func NewHandler(engine *Engine, csrf admin.UserCSRFVerifier) *Handler { return &Handler{engine, csrf} }
 func RegisterRoutes(mux *http.ServeMux, h *Handler) {
 	mux.HandleFunc("GET /api/databases/{database_id}/migrations/history", h.History)
-	mux.HandleFunc("POST /api/databases/{database_id}/migrations/execute", h.Execute)
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/diff", h.Diff)
 }
 func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, mutate bool) (int, bool) {
@@ -52,33 +51,6 @@ func (h *Handler) History(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpapi.WriteJSON(w, 200, map[string]any{"attempts": rows, "latest_version": latest, "limit": limit, "offset": offset}, nil)
-}
-func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
-	id, ok := h.prepare(w, r, true)
-	if !ok {
-		return
-	}
-	if err := h.engine.access.RequireEdit(r.Context(), id); err != nil {
-		writeError(w, err)
-		return
-	}
-	var req MigrationRequest
-	if !httpapi.DecodeJSON(w, r, &req) {
-		return
-	}
-	result, err := h.engine.Run(r.Context(), id, req)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrVersionConflict):
-			httpapi.WriteJSON(w, 409, result, &httpapi.Error{Code: "version_conflict", Message: err.Error()})
-		case errors.Is(err, ErrMigrationFailed):
-			httpapi.WriteJSON(w, 422, result, &httpapi.Error{Code: "migration_failed", Message: "Migration gagal. Lihat status dan SQLSTATE pada history; periksa SQL serta privilege target."})
-		default:
-			writeError(w, err)
-		}
-		return
-	}
-	httpapi.WriteJSON(w, 200, result, nil)
 }
 func (h *Handler) Diff(w http.ResponseWriter, r *http.Request) {
 	id, ok := h.prepare(w, r, true)

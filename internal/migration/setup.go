@@ -39,6 +39,20 @@ func SetupPostgresHistory(ctx context.Context, db *sql.DB, executor string) erro
  ALTER TABLE platform_migrations.attempts ADD COLUMN IF NOT EXISTS legacy_source_id BIGINT UNIQUE;
  CREATE TABLE IF NOT EXISTS platform_migrations.legacy_sources(id INT PRIMARY KEY CHECK(id=1),fingerprint TEXT NOT NULL);
  CREATE UNIQUE INDEX IF NOT EXISTS one_successful_version ON platform_migrations.attempts(version) WHERE status='SUCCESS';
+ CREATE TABLE IF NOT EXISTS platform_migrations.batch_checkpoints(
+  attempt_id BIGINT NOT NULL REFERENCES platform_migrations.attempts(id),
+  batch_no BIGINT NOT NULL, cursor_id BIGINT NOT NULL, row_ids BIGINT[] NOT NULL,
+  PRIMARY KEY(attempt_id,batch_no));
+ CREATE OR REPLACE FUNCTION platform_migrations.record_batch(token TEXT, n BIGINT, keys BIGINT[]) RETURNS VOID
+ LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $body$
+ DECLARE attempt BIGINT;
+ BEGIN
+  SELECT id INTO STRICT attempt FROM platform_migrations.attempts WHERE status='RUNNING'
+   AND capability_hash=pg_catalog.sha256(pg_catalog.convert_to(token,'UTF8')) FOR UPDATE;
+  INSERT INTO platform_migrations.batch_checkpoints VALUES(attempt,n,keys[cardinality(keys)],keys);
+ END $body$;
+ REVOKE ALL ON FUNCTION platform_migrations.record_batch(TEXT,BIGINT,BIGINT[]) FROM PUBLIC;
+ GRANT EXECUTE ON FUNCTION platform_migrations.record_batch(TEXT,BIGINT,BIGINT[]) TO %s;
  REVOKE ALL ON ALL TABLES IN SCHEMA platform_migrations FROM PUBLIC;
  REVOKE ALL ON ALL SEQUENCES IN SCHEMA platform_migrations FROM PUBLIC;
  CREATE OR REPLACE VIEW platform_migrations.history AS SELECT id,version,executed_by,executed_at,finished_at,status,query_sql,sql_state,error_code FROM platform_migrations.attempts;
@@ -54,7 +68,7 @@ func SetupPostgresHistory(ctx context.Context, db *sql.DB, executor string) erro
  GRANT USAGE ON SCHEMA platform_migrations TO %s;
  GRANT SELECT ON platform_migrations.history TO %s;
  GRANT EXECUTE ON FUNCTION platform_migrations.complete_attempt(TEXT) TO %s;
- `, pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor)))
+ `, pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor)))
 	if err != nil {
 		return err
 	}

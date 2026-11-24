@@ -37,7 +37,7 @@ func TestValidateJobSubmission(t *testing.T) {
 		{"nul", "CREATE TABLE example(id INT)\x00", "a", 1, database.Postgres, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateSubmission(context.Background(), JobSubmission{tc.version, tc.sql, tc.nonAtomic}, tc.driver, tc.key)
+			err := ValidateSubmission(context.Background(), JobSubmission{Version: tc.version, QuerySQL: tc.sql, NonAtomicDDL: tc.nonAtomic}, tc.driver, tc.key)
 			if (err == nil) != tc.valid {
 				t.Fatalf("valid=%v, error=%v", tc.valid, err)
 			}
@@ -113,7 +113,7 @@ func TestJobHTTPRejectsInvalidRequests(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mux := http.NewServeMux()
-			RegisterJobRoutes(mux, NewJobHandler(nil, jobTestCSRF{tc.csrf}))
+			RegisterJobRoutes(mux, NewJobHandler(&JobService{access: jobTestPermissions{}}, jobTestCSRF{tc.csrf}))
 			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 			r.Header.Set("Content-Type", tc.contentType)
 			if tc.key != "" {

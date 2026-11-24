@@ -148,6 +148,14 @@ func (e *Engine) Run(ctx context.Context, id int, req MigrationRequest) (Executi
 	if err = control.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM "+table+" WHERE status='SUCCESS'").Scan(&latest); err != nil {
 		return out, ErrUnsafeTarget
 	}
+	return executeLocked(ctx, target, control, cfg, user, req, statements, latest, nil, nil)
+}
+
+// executeLocked uses the caller's physical target lock through history and commit.
+func executeLocked(ctx context.Context, target *sql.DB, control *sql.Conn, cfg database.DatabaseConnection, user int, req MigrationRequest, statements []string, latest int, onStart func(int64) error, batch func(string, int64) error) (ExecutionResult, error) {
+	var out ExecutionResult
+	var err error
+	table := cfg.Driver.Quote(HistorySchema(cfg.Driver, cfg.DatabaseName)) + ".attempts"
 	secret := make([]byte, 32)
 	if _, err = rand.Read(secret); err != nil {
 		return out, err
@@ -202,8 +210,30 @@ func (e *Engine) Run(ctx context.Context, id int, req MigrationRequest) (Executi
 	if req.Version <= latest {
 		return fail(ErrVersionConflict, "version_conflict")
 	}
+	if onStart != nil {
+		if err = onStart(attemptID); err != nil {
+			return fail(err, "claim_lost")
+		}
+	}
+	if batch != nil {
+		if err = batch(capability, attemptID); err != nil {
+			if errors.Is(err, ErrOutcomeUnknown) {
+				return out, err
+			}
+			if errors.Is(err, errPartial) {
+				_, markErr := control.ExecContext(ctx, "UPDATE "+table+" SET status='NEEDS_REVIEW',error_code='partial_batch',capability_hash=NULL,finished_at=CURRENT_TIMESTAMP WHERE id=$1 AND status='RUNNING'", attemptID)
+				if markErr != nil {
+					return out, ErrOutcomeUnknown
+				}
+				return out, err
+			}
+			return fail(err, "batch_failed")
+		}
+		out.Status = "SUCCESS"
+		return out, nil
+	}
 	if cfg.Driver.IsMySQL() {
-		return e.runMySQL(ctx, target, control, cfg, req, statements, capability, out, fail)
+		return runMySQL(ctx, target, control, cfg, req, statements, capability, out, fail)
 	}
 	tx, err := target.BeginTx(ctx, nil)
 	if err != nil {

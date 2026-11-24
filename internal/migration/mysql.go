@@ -73,7 +73,7 @@ func verifyMySQLHistory(ctx context.Context, target, audit *sql.DB, cfg database
 	return nil
 }
 
-func (e *Engine) runMySQL(ctx context.Context, target *sql.DB, control *sql.Conn, cfg database.DatabaseConnection, req MigrationRequest, statements []string, capability string, out ExecutionResult, fail func(error, string) (ExecutionResult, error)) (ExecutionResult, error) {
+func runMySQL(ctx context.Context, target *sql.DB, control *sql.Conn, cfg database.DatabaseConnection, req MigrationRequest, statements []string, capability string, out ExecutionResult, fail func(error, string) (ExecutionResult, error)) (ExecutionResult, error) {
 	schema := cfg.Driver.Quote(HistorySchema(cfg.Driver, cfg.DatabaseName))
 	if req.NonAtomicDDL {
 		if _, err := target.ExecContext(ctx, statements[0]); err != nil {
