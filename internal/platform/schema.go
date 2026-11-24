@@ -130,6 +130,9 @@ ALTER TABLE platform.migration_jobs
  ADD COLUMN IF NOT EXISTS attempt_id BIGINT,
  ADD COLUMN IF NOT EXISTS committed_batches BIGINT NOT NULL DEFAULT 0,
  ADD COLUMN IF NOT EXISTS committed_rows BIGINT NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS retry_count BIGINT NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS retry_pending BOOLEAN NOT NULL DEFAULT FALSE,
+ ADD COLUMN IF NOT EXISTS retry_requested_by INT REFERENCES platform.users(id),
  ADD COLUMN IF NOT EXISTS lease_token TEXT,
  ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
  ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
@@ -163,7 +166,12 @@ CREATE OR REPLACE VIEW platform.job_admission AS
  EXISTS (SELECT 1 FROM platform.users u JOIN platform.group_memberships m ON m.user_id=u.id
    JOIN platform.group_database_access g ON g.group_id=m.group_id
    WHERE u.id=j.submitted_by AND u.is_active AND g.database_id=j.database_id
-   AND g.access_level='View + Edit') AS can_edit,
+   AND g.access_level='View + Edit')
+ AND (j.retry_requested_by IS NULL OR EXISTS (
+   SELECT 1 FROM platform.users u JOIN platform.group_memberships m ON m.user_id=u.id
+   JOIN platform.group_database_access g ON g.group_id=m.group_id
+   WHERE u.id=j.retry_requested_by AND u.is_active AND g.database_id=j.database_id
+   AND g.access_level='View + Edit')) AS can_edit,
  EXISTS (SELECT 1 FROM platform.group_database_access WHERE database_id=j.database_id)
  AND NOT EXISTS (SELECT 1 FROM platform.group_database_access g WHERE g.database_id=j.database_id
    AND NOT EXISTS (SELECT 1 FROM platform.job_approvals a JOIN platform.users u ON u.id=a.leader_id

@@ -401,7 +401,6 @@ Contoh pengajuan batch PostgreSQL:
 
 Worker mendukung tabel biasa dengan primary key integer tunggal bernama `id` yang stabil dan assignment boolean `TRUE` atau `FALSE`. Ukuran batch 1 sampai 100.000 row. Sebelum UPDATE pertama, worker membaca seluruh ID dari satu snapshot dan menyimpan daftar ID per batch di `platform_migrations.batch_scope` pada target. Semua halaman dan penanda `batch_scope_ready` di-commit bersama, termasuk untuk cakupan kosong. Jalankan kembali `cmd/target-setup` pada target PostgreSQL yang sudah ada untuk memasang perubahan schema ini.
 
-Setiap transaksi UPDATE mencatat checkpoint berisi ID attempt, nomor batch, cursor terakhir, dan ID row yang diubah. Halaman yang sudah committed dan cakupan yang masih tersisa tetap tersimpan setelah koneksi worker terputus. Attempt lama mempertahankan checkpoint lamanya, tetapi ID yang dahulu hanya disimpan di tabel sementara tidak dapat direkonstruksi dengan pasti. Kegagalan sesudah satu atau lebih batch committed menghasilkan `PARTIAL` dan menahan migration berikutnya pada target tersebut. Retry dan pembatalan batch merupakan tahap berikutnya.
 
 Untuk mengulang pengukuran, gunakan cluster uji disposable, set `TEST_PLATFORM_DSN` serta `TEST_LARGE_BATCH=1`, lalu jalankan `go test ./internal/server -run TestLargeQueuedBatch -count=1 -v`. Pada pengujian lokal, UPDATE 250.000 row memerlukan 1,104 detik. Setelah transaksi baseline dibatalkan, job memproses dataset yang sama dalam 25 batch berukuran 10.000 dalam 1,490 detik dari pengajuan hingga hasil dibaca.
 

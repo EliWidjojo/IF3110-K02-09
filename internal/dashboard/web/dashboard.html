@@ -49,6 +49,7 @@
  <div class="actions"><button id="migration-run" class="primary" type="submit" disabled>Ajukan migration</button><button id="migration-analyze" type="button" disabled>Analisis SQL ini</button></div><p class="muted">SQL maksimum 12 KiB. Tidak ada draft yang disimpan. Versi gagal dapat dipakai ulang; versi sukses harus meningkat.</p>
  </form><div class="card"><h2>Pantau dan tinjau job</h2>
  <label>ID job<input id="migration-job-id" type="number" min="1"></label><button id="migration-monitor" type="button">Buka job</button>
+ <button id="migration-retry" type="button" hidden>Lanjutkan batch dari checkpoint</button>
  <details id="migration-review" hidden><summary>Snapshot untuk persetujuan</summary><pre id="migration-snapshot"></pre>
  <label>ID grup yang Anda pimpin<input id="migration-group" type="number" min="1"></label><button id="migration-approve" type="button">Setujui untuk grup</button></details>
  </div><p id="migration-job-status" role="status"></p><p id="migration-status" role="status">Pilih database untuk melihat history.</p>

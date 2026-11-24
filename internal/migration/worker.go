@@ -118,7 +118,11 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		return err
 	}
 	finish := func(status JobStatus, code string) error {
+		if c.job.retryPending && status == JobFailed && c.job.CommittedBatches > 0 {
+			status = JobPartial
+		}
 		res, err := tx.ExecContext(ctx, `UPDATE platform.migration_jobs SET status=$3,error_code=$4,
+		 retry_pending=(retry_pending AND $3='QUEUED'),
 		 lease_token=NULL,lease_until=NULL,finished_at=CASE WHEN $3 IN ('FAILED','SUCCESS','PARTIAL','NEEDS_REVIEW') THEN clock_timestamp() ELSE NULL END
 		 WHERE `+ownsLease, c.job.ID, c.token, status, code)
 		if err = checkOwner(res, err); err != nil {
@@ -141,7 +145,7 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	}
 	if code, err := admission(); err != nil {
 		return err
-	} else if code != "" && (c.job.AttemptID == nil || code == "target_changed") {
+	} else if code != "" && (c.job.AttemptID == nil || c.job.retryPending || code == "target_changed") {
 		return check(code)
 	}
 	if err = ValidateSubmission(ctx, c.job.Submission, c.job.Driver, "preflight"); err != nil {
@@ -184,15 +188,39 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		return finish(JobFailed, "unsafe_target")
 	}
 	schema := cfg.Driver.Quote(HistorySchema(cfg.Driver, cfg.DatabaseName))
-	reconcile := func() error {
+	reconcile := func(batchError string) error {
 		var state string
-		if err := control.QueryRowContext(ctx, "SELECT status FROM "+schema+".attempts WHERE id="+cfg.Driver.Bind(1), *c.job.AttemptID).Scan(&state); err != nil {
-			return finish(JobNeedsReview, "outcome_unknown")
-		}
+		var frozen bool
 		if c.job.Submission.BatchSize > 0 {
+			// Fence the previous executor on the same row its checkpoint and
+			// completion functions lock, then read the committed target evidence.
+			if _, err := control.ExecContext(ctx, `UPDATE platform_migrations.attempts SET capability_hash=NULL
+				WHERE id=$1 AND status='RUNNING'`, *c.job.AttemptID); err != nil {
+				return finish(JobNeedsReview, "outcome_unknown")
+			}
+			if err := control.QueryRowContext(ctx, `SELECT status,batch_scope_ready FROM platform_migrations.attempts
+				WHERE id=$1`, *c.job.AttemptID).Scan(&state, &frozen); err != nil {
+				return finish(JobNeedsReview, "outcome_unknown")
+			}
 			if err = w.syncProgress(ctx, &c, control, *c.job.AttemptID); err != nil {
 				return finish(JobNeedsReview, "checkpoint_unavailable")
 			}
+			if frozen && state == "RUNNING" {
+				targetState, targetCode := "FAILED", "batch_failed"
+				if c.job.CommittedBatches > 0 {
+					targetState, targetCode = "NEEDS_REVIEW", "partial_batch"
+				}
+				if _, err := control.ExecContext(ctx, `UPDATE platform_migrations.attempts
+					SET status=$2,error_code=$3,finished_at=clock_timestamp() WHERE id=$1 AND status='RUNNING'`,
+					*c.job.AttemptID, targetState, targetCode); err != nil {
+					return finish(JobNeedsReview, "outcome_unknown")
+				}
+				if c.job.CommittedBatches == 0 {
+					return finish(JobFailed, batchError)
+				}
+			}
+		} else if err := control.QueryRowContext(ctx, "SELECT status FROM "+schema+".attempts WHERE id="+cfg.Driver.Bind(1), *c.job.AttemptID).Scan(&state); err != nil {
+			return finish(JobNeedsReview, "outcome_unknown")
 		}
 		switch state {
 		case "SUCCESS":
@@ -201,12 +229,38 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 			return finish(JobFailed, "sql_failed")
 		}
 		if c.job.Submission.BatchSize > 0 && c.job.CommittedBatches > 0 {
-			return finish(JobPartial, "interrupted")
+			return finish(JobPartial, batchError)
 		}
 		return finish(JobNeedsReview, "outcome_unknown")
 	}
 	if c.job.AttemptID != nil {
-		return reconcile()
+		if c.job.retryPending {
+			if code, err := admission(); err != nil {
+				return err
+			} else if code != "" {
+				return check(code)
+			}
+			// Consume this approval round before issuing a fresh target capability.
+			// A worker reclaiming an expired lease only reconciles the outcome.
+			res, err := w.db.ExecContext(ctx, `UPDATE platform.migration_jobs SET retry_pending=FALSE WHERE `+ownsLease, c.job.ID, c.token)
+			if err = checkOwner(res, err); err != nil {
+				return err
+			}
+			token, err := reopenBatch(ctx, control, c.job)
+			if errors.Is(err, errUnsafeCheckpoint) {
+				return finish(JobNeedsReview, "unsafe_checkpoint")
+			}
+			if err != nil {
+				return finish(JobNeedsReview, "checkpoint_unavailable")
+			}
+			if token != "" {
+				if err := w.runBatch(ctx, c, target, control, token, *c.job.AttemptID); err != nil && !errors.Is(err, ErrOutcomeUnknown) {
+					return reconcile("batch_failed")
+				}
+			}
+			return reconcile("interrupted")
+		}
+		return reconcile("interrupted")
 	}
 	var latest, unresolved int
 	if err = control.QueryRowContext(ctx, "SELECT COALESCE(MAX(CASE WHEN status='SUCCESS' THEN version END),0),COUNT(CASE WHEN status IN ('RUNNING','NEEDS_REVIEW') THEN 1 END) FROM "+schema+".attempts").Scan(&latest, &unresolved); err != nil {
@@ -275,7 +329,7 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	case errors.Is(err, errPartial):
 		return finish(JobPartial, "batch_failed")
 	case errors.Is(err, ErrOutcomeUnknown) && c.job.AttemptID != nil:
-		return reconcile()
+		return reconcile("interrupted")
 	case errors.Is(err, ErrOutcomeUnknown) || result.Status == "NEEDS_REVIEW":
 		return finish(JobNeedsReview, "outcome_unknown")
 	default:

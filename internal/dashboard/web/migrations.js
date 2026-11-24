@@ -7,7 +7,7 @@
  const base=()=>`/api/databases/${encodeURIComponent($("migration-db").value)}/migrations`;
  function scope(){controller?.abort();controller=new AbortController();return {ticket:++generation,signal:controller.signal};}
  function permissions(){$("migration-db").disabled=busy||databases.length===0;const edit=editable()&&!busy;$("migration-sql").readOnly=!edit;$("migration-version").disabled=!edit;$("migration-run").disabled=!edit;$("diff-generate").disabled=!edit;$("diff-to-editor").disabled=!edit||!candidate;$("migration-analyze").disabled=!edit||selected()?.driver!=="postgres";$("migration-ddl-label").hidden=!["mysql","mariadb"].includes(selected()?.driver);$("migration-warning").hidden=$("migration-ddl-label").hidden;$("migration-access").textContent=selected()?`${selected().name} · ${selected().access_level}`:"Pilih database.";}
- function clear(){reviewed=null;$("migration-review").hidden=true;$("migration-job-id").value="";monitorGeneration++; retry=null; $("migration-job-status").textContent=""; scope();offset=0;candidate="";$("migration-history").replaceChildren();$("migration-sql").value="";$("migration-version").value="";$("migration-ddl").checked=false;$("diff-sql").textContent="";$("diff-changes").replaceChildren();operationFields();permissions();}
+ function clear(){reviewed=null;$("migration-retry").hidden=true;$("migration-review").hidden=true;$("migration-job-id").value="";monitorGeneration++; retry=null; $("migration-job-status").textContent=""; scope();offset=0;candidate="";$("migration-history").replaceChildren();$("migration-sql").value="";$("migration-version").value="";$("migration-ddl").checked=false;$("diff-sql").textContent="";$("diff-changes").replaceChildren();operationFields();permissions();}
  async function history(resetVersion=false){
   const id=$("migration-db").value;if(!id){clear();return;}
   const request=scope();$("migration-status").textContent="Memuat history…";
@@ -38,9 +38,11 @@
   $("migration-job-id").value=job.id;
   while(ticket===monitorGeneration && app.user){
    reviewed=job;
+   $("migration-retry").hidden=!(editable() && job.submission.batch_size>0 && job.attempt_id && ["PARTIAL","FAILED"].includes(job.status));
    $("migration-review").hidden=job.status!=="QUEUED";
    $("migration-snapshot").textContent=JSON.stringify(job.submission,null,2);
-   $("migration-job-status").textContent=`Job #${job.id} ? ${job.status} ? ${job.committed_batches} batch, ${job.committed_rows} row committed ${job.error_code||""}`;
+   const round=job.retry_count ? ` · Retry #${job.retry_count}` : "";
+   $("migration-job-status").textContent=`Job #${job.id}${round} · ${job.status} · ${job.committed_batches} batch, ${job.committed_rows} row committed ${job.error_code||""}`;
    if(!["QUEUED","RUNNING","READY"].includes(job.status)){await history(true);return;}
    await new Promise(resolve=>setTimeout(resolve,1500));
    if(ticket!==monitorGeneration)return;
@@ -70,15 +72,22 @@
  async function diff(){if(!editable())throw new Error("Akses View + Edit diperlukan.");let input;try{input=JSON.parse($("diff-input").value);}catch{throw new Error("Schema tujuan harus berupa JSON valid.");}const request=scope();candidate="";permissions();const result=await app.api(`${base()}/diff`,{method:"POST",body:input,signal:request.signal});if(request.ticket!==generation)return;candidate=result.sql;$("diff-sql").textContent=candidate||"Tidak ada SQL tambahan yang dapat dihasilkan otomatis.";$("diff-limitations").textContent=result.limitations;app.table($("diff-changes"),[{label:"Objek",value:d=>d.object},{label:"Perbedaan",value:d=>d.kind},{label:"Keputusan",value:d=>`${d.requires_decision?"Perlu keputusan: ":""}${d.message}`}],result.differences,"Tidak ada perbedaan pada cakupan yang didukung.");permissions();}
  document.addEventListener("DOMContentLoaded",()=>{
   $("migration-monitor").addEventListener("click",()=>app.action(async()=>{
-   const ticket=++monitorGeneration;reviewed=null;$("migration-review").hidden=true;
+   const ticket=++monitorGeneration;reviewed=null;$("migration-review").hidden=true;$("migration-retry").hidden=true;
    const job=await app.api(base()+"/jobs/"+encodeURIComponent($("migration-job-id").value));
    await monitor(job,ticket);
   }));
+  $("migration-retry").addEventListener("click",()=>app.action(async()=>{
+   const job=reviewed;
+   if(!job||!editable())return;
+   const ticket=++monitorGeneration;
+   const queued=await app.api(job.status_url+"/retries/"+(job.retry_count+1),{method:"PUT"});
+   await monitor(queued,ticket);
+  },$("migration-retry")));
   $("migration-approve").addEventListener("click",()=>app.action(async()=>{
    if(!reviewed||reviewed.status!=="QUEUED")return;
    const group=Number($("migration-group").value);
    if(!Number.isSafeInteger(group)||group<=0)throw new Error("Masukkan ID grup leader.");
-   await app.api(reviewed.status_url+"/approvals/"+group,{method:"PUT"});
+   await app.api(reviewed.status_url+"/approvals/"+group+"?retry_count="+reviewed.retry_count,{method:"PUT"});
    app.notice("Persetujuan grup tersimpan.");
   }));
   $("migration-operation").addEventListener("change",operationFields);$("migration-batch").addEventListener("input",operationFields);

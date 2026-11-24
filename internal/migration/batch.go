@@ -2,15 +2,74 @@ package migration
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 )
 
 var errPartial = errors.New("sebagian batch sudah committed")
+var errUnsafeCheckpoint = errors.New("checkpoint atau riwayat target tidak mendukung retry")
+
+// Called under the target advisory lock. The row lock waits for any in-flight
+// record_batch or complete_attempt transaction before inspecting its outcome.
+func reopenBatch(ctx context.Context, audit *sql.Conn, job Job) (string, error) {
+	tx, err := audit.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	id := *job.AttemptID
+	var state, code string
+	var frozen bool
+	err = tx.QueryRowContext(ctx, `SELECT status,error_code,batch_scope_ready FROM platform_migrations.attempts
+		WHERE id=$1 AND version=$2 AND executed_by=$3 AND query_sql=$4 FOR UPDATE`,
+		id, job.Submission.Version, job.SubmittedBy, job.Submission.QuerySQL).Scan(&state, &code, &frozen)
+	if err != nil {
+		return "", err
+	}
+	if state == "SUCCESS" {
+		return "", nil
+	}
+	if !frozen || !(state == "RUNNING" || state == "NEEDS_REVIEW" && code == "partial_batch" || state == "FAILED" && code == "batch_failed") {
+		return "", errUnsafeCheckpoint
+	}
+	var valid bool
+	err = tx.QueryRowContext(ctx, `SELECT
+		NOT EXISTS (SELECT 1 FROM platform_migrations.attempts WHERE id <> $1 AND
+		   (status IN ('RUNNING','NEEDS_REVIEW') OR (status='SUCCESS' AND (version >= $2 OR id > $1))))
+		AND (SELECT count(*)=coalesce(max(batch_no),0) FROM platform_migrations.batch_scope WHERE attempt_id=$1)
+		AND (SELECT count(*)=coalesce(max(c.batch_no),0) AND coalesce(bool_and(
+		    s.batch_no IS NOT NULL AND c.row_ids=s.row_ids AND c.cursor_id=s.row_ids[cardinality(s.row_ids)]),true)
+		    FROM platform_migrations.batch_checkpoints c LEFT JOIN platform_migrations.batch_scope s USING(attempt_id,batch_no)
+		    WHERE c.attempt_id=$1)`, id, job.Submission.Version).Scan(&valid)
+	if err != nil {
+		return "", err
+	}
+	if !valid {
+		return "", errUnsafeCheckpoint
+	}
+	var secret [32]byte
+	if _, err := rand.Read(secret[:]); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(secret[:])
+	digest := sha256.Sum256([]byte(token))
+	if _, err = tx.ExecContext(ctx, `UPDATE platform_migrations.attempts SET status='RUNNING',
+		error_code='',finished_at=NULL,sql_state='',capability_hash=$2 WHERE id=$1`, id, digest[:]); err != nil {
+		return "", err
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return token, nil
+}
 
 // The deliberately narrow template lets the worker constrain every UPDATE to
 // the selected primary keys without rewriting arbitrary user SQL.
@@ -102,6 +161,7 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 	}
 	table := "public." + pq.QuoteIdentifier(strings.ToLower(match[1]))
 	column := pq.QuoteIdentifier(strings.ToLower(match[2]))
+	update := "UPDATE ONLY " + table + " SET " + column + " = " + strings.ToUpper(match[3]) + " WHERE id=ANY($1)"
 	var valid bool
 	err := audit.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0]
  WHERE i.indrelid=$1::regclass AND i.indisprimary AND i.indnkeyatts=1 AND a.attname='id' AND a.atttypid IN ('int2'::regtype,'int4'::regtype,'int8'::regtype))`, table).Scan(&valid)
@@ -136,42 +196,59 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 		if err != nil && !last {
 			return err
 		}
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		if last {
-			_, err = tx.ExecContext(ctx, "SELECT platform_migrations.complete_attempt($1)", token)
-			if err != nil {
-				tx.Rollback()
+		for retries := 0; ; retries++ {
+			err = commitBatchPage(ctx, conn, token, batches+1, update, keys)
+			if err == nil {
+				break
+			}
+			var pgErr *pq.Error
+			if retries >= 3 || !errors.As(err, &pgErr) ||
+				(pgErr.Code != "40001" && pgErr.Code != "40P01" && pgErr.Code != "55P03") {
 				return err
 			}
-			if err = tx.Commit(); err != nil {
-				return ErrOutcomeUnknown
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Second << retries):
 			}
+		}
+		if last {
 			return nil
 		}
-		res, err := tx.ExecContext(ctx, "UPDATE ONLY "+table+" SET "+column+" = "+strings.ToUpper(match[3])+" WHERE id=ANY($1)", keys)
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil || affected != int64(len(keys)) {
-			tx.Rollback()
-			return errors.New("cakupan row berubah")
-		}
-		if _, err = tx.ExecContext(ctx, "SELECT platform_migrations.record_batch($1,$2,$3)", token, batches+1, keys); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err = tx.Commit(); err != nil {
-			return ErrOutcomeUnknown
-		}
 		batches++
-		rows += affected
+		rows += int64(len(keys))
 		if err = w.progress(ctx, c, batches, rows); err != nil {
 			return ErrOutcomeUnknown
 		}
 	}
+}
+
+func commitBatchPage(ctx context.Context, conn *sql.Conn, token string, number int64, update string, keys pq.Int64Array) error {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if len(keys) == 0 {
+		_, err = tx.ExecContext(ctx, "SELECT platform_migrations.complete_attempt($1)", token)
+	} else {
+		res, err := tx.ExecContext(ctx, update, keys)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil || affected != int64(len(keys)) {
+			return errors.New("cakupan row berubah")
+		}
+		if _, err = tx.ExecContext(ctx, "SELECT platform_migrations.record_batch($1,$2,$3)", token, number, keys); err != nil {
+			return err
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return ErrOutcomeUnknown
+	}
+	return nil
 }
