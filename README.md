@@ -385,6 +385,25 @@ Privilege database melindungi history meskipun SQL mencoba UPDATE, DELETE, DROP,
 
 SQL maksimum 12 KiB. Cakupan PostgreSQL adalah DDL schema/table/column/constraint/index/sequence/type/view yang didukung validator serta INSERT/UPDATE/DELETE. Kontrol transaksi, stored program, pengaturan session, dan administrasi role tidak disediakan melalui editor. Batas request 16 KiB, konteks migration 30 detik, statement timeout PostgreSQL 20 detik, lock timeout SQL 3 detik. Akun dan fungsi target tetap harus tepercaya; platform tidak menjanjikan sandbox untuk seluruh efek eksternal SQL.
 
+### Menjalankan migration melalui worker
+
+Jalankan `go run ./cmd/worker` pada proses terpisah dengan environment database internal dan kunci enkripsi yang sama seperti server. Untuk target PostgreSQL lama, jalankan kembali `cmd/target-setup` menggunakan akun pencatat agar tabel checkpoint dan fungsi pencatat batch tersedia.
+
+Editor mengirim ke `POST /api/databases/{database_id}/migrations/jobs`. Alias `/migrations/execute` memakai kontrak antrean yang sama. Keduanya memerlukan session, CSRF, izin edit, dan satu header `Idempotency-Key`. Simpan `id` serta `status_url` dari respons 202. Tetapkan anggota aktif sebagai leader melalui `PUT /api/admin/groups/{group_id}/leader` dengan body `{"user_id":2}`. Leader tiap grup dengan akses memberikan approval melalui `PUT /api/databases/{database_id}/migrations/jobs/{id}/approvals/{group_id}` sesudah membaca snapshot job. Dashboard memantau job yang diajukan. Detail mencantumkan attempt ID, status, error, dan jumlah batch serta row yang committed.
+
+Untuk migration biasa, kirim `version`, `query_sql`, dan opsional `down_sql`. Rollback mengacu ke job sukses terkini yang menyertakan SQL down. Kirim `{"operation":"rollback","source_job":12,"version":4}`. Forward mengacu ke job rollback yang sukses menggunakan `operation:"forward"`. Setiap operasi mendapat versi eksekusi baru dan approval sendiri.
+
+Contoh pengajuan batch PostgreSQL:
+
+```json
+{"version":1,"batch_size":10000,"query_sql":"UPDATE public.items SET processed = TRUE"}
+```
+
+Worker mendukung tabel biasa dengan primary key integer tunggal bernama `id` yang stabil dan assignment boolean `TRUE` atau `FALSE`. Ukuran batch 1 sampai 100.000 row. Sebelum UPDATE pertama, worker membaca seluruh ID dari satu snapshot dan menyimpan daftar ID per batch di `platform_migrations.batch_scope` pada target. Semua halaman dan penanda `batch_scope_ready` di-commit bersama, termasuk untuk cakupan kosong. Jalankan kembali `cmd/target-setup` pada target PostgreSQL yang sudah ada untuk memasang perubahan schema ini.
+
+
+Untuk mengulang pengukuran, gunakan cluster uji disposable, set `TEST_PLATFORM_DSN` serta `TEST_LARGE_BATCH=1`, lalu jalankan `go test ./internal/server -run TestLargeQueuedBatch -count=1 -v`. Pada pengujian lokal, UPDATE 250.000 row memerlukan 1,104 detik. Setelah transaksi baseline dibatalkan, job memproses dataset yang sama dalam 25 batch berukuran 10.000 dalam 1,490 detik dari pengajuan hingga hasil dibaca.
+
 ## Batas viewer dan representasi data
 
 Viewer menampilkan schema, table, column, constraint, index, dan data. Identifier divalidasi dan di-quote terpisah; nilai pagination memakai parameter SQL. Ukuran halaman 1–100 (default 50), hasil data maksimum 2 MiB, timeout operasi 5 detik. Primary key dipakai untuk urutan stabil; tanpa primary key, UI menjelaskan bahwa urutan tidak dijamin. Perubahan data bersamaan tetap dapat menggeser halaman berbasis offset.

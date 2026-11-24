@@ -13,8 +13,8 @@ func TestRealDatabaseIntegration(t *testing.T) {
 	f.grant(t, 2, "View + Edit")
 	b := &browser{t: t, handler: f.handler}
 	b.login("alice")
-	status(t, f.execute(b, 1, `CREATE TABLE public.values_demo(id BIGINT PRIMARY KEY,amount NUMERIC,bin BYTEA,note TEXT,flag BOOLEAN,stamp TIMESTAMPTZ,document JSONB,CONSTRAINT amount_check CHECK(amount>0)); CREATE INDEX note_index ON public.values_demo(note)`), 200)
-	status(t, f.execute(b, 2, `INSERT INTO public.values_demo VALUES(9007199254740993,12345678901234567890.123,decode('ff00','hex'),NULL,true,'2026-10-25 10:00:00+07','{"large":9007199254740993,"null":null}')`), 200)
+	f.expectMigration(b, 1, `CREATE TABLE public.values_demo(id BIGINT PRIMARY KEY,amount NUMERIC,bin BYTEA,note TEXT,flag BOOLEAN,stamp TIMESTAMPTZ,document JSONB,CONSTRAINT amount_check CHECK(amount>0)); CREATE INDEX note_index ON public.values_demo(note)`, "SUCCESS")
+	f.expectMigration(b, 2, `INSERT INTO public.values_demo VALUES(9007199254740993,12345678901234567890.123,decode('ff00','hex'),NULL,true,'2026-10-25 10:00:00+07','{"large":9007199254740993,"null":null}')`, "SUCCESS")
 	base := fmt.Sprintf("/api/viewer/databases/%d/schemas/public/tables/values_demo", f.databaseID)
 	meta := b.request("GET", base, "", nil)
 	status(t, meta, 200)
@@ -50,7 +50,7 @@ func TestRealDatabaseIntegration(t *testing.T) {
 	status(t, b.request("GET", base+"/data?limit=101", "", nil), 400)
 	status(t, b.request("GET", base+"/data?offset=1", "", nil), 200)
 	status(t, b.request("GET", fmt.Sprintf("/api/viewer/databases/%d/schemas/public/tables/missing/data", f.databaseID), "", nil), 404)
-	status(t, f.execute(b, 3, `INSERT INTO values_demo(id) VALUES(1); INSERT INTO values_demo(id) VALUES(1)`), 422)
+	f.expectMigration(b, 3, `INSERT INTO values_demo(id) VALUES(1); INSERT INTO values_demo(id) VALUES(1)`, "FAILED")
 	var count int
 	f.roles.Executor.QueryRow(`SELECT count(*) FROM values_demo`).Scan(&count)
 	if count != 1 {
@@ -61,8 +61,8 @@ func TestRealDatabaseIntegration(t *testing.T) {
 	if !strings.Contains(history.Body.String(), "FAILED") || !strings.Contains(history.Body.String(), "23505") {
 		t.Fatal("history gagal tidak lengkap")
 	}
-	status(t, f.execute(b, 3, `UPDATE platform_migrations.history SET executed_by=999`), 422)
-	status(t, f.execute(b, 3, `INSERT INTO values_demo(id,bin) VALUES(2,decode(repeat('ff',2097153),'hex'))`), 200)
+	f.expectMigration(b, 3, `UPDATE platform_migrations.history SET executed_by=999`, "FAILED")
+	f.expectMigration(b, 3, `INSERT INTO values_demo(id,bin) VALUES(2,decode(repeat('ff',2097153),'hex'))`, "SUCCESS")
 	status(t, b.request("GET", base+"/data", "", nil), 413)
 }
 func TestQueryAnalysisPermissionsValidationAndPlans(t *testing.T) {
@@ -70,7 +70,7 @@ func TestQueryAnalysisPermissionsValidationAndPlans(t *testing.T) {
 	group := f.grant(t, 2, "View + Edit")
 	b := &browser{t: t, handler: f.handler}
 	b.login("alice")
-	status(t, f.execute(b, 1, `CREATE TABLE public.analysis_items(id INT PRIMARY KEY,note TEXT); INSERT INTO public.analysis_items VALUES(1,'safe')`), 200)
+	f.expectMigration(b, 1, `CREATE TABLE public.analysis_items(id INT PRIMARY KEY,note TEXT); INSERT INTO public.analysis_items VALUES(1,'safe')`, "SUCCESS")
 	endpoint := fmt.Sprintf("/api/viewer/databases/%d/explain", f.databaseID)
 	for _, analyze := range []bool{false, true} {
 		body, _ := json.Marshal(map[string]any{"query": "SELECT * FROM public.analysis_items WHERE id=1", "analyze": analyze})

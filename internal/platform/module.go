@@ -35,6 +35,7 @@ type PlatformModule struct {
 	viewer         *viewer.ViewerService
 	analysis       *queryanalysis.QueryAnalysisService
 	migration      *migration.Engine
+	jobs           *migration.JobService
 	security       SecurityDependencies
 }
 
@@ -61,6 +62,7 @@ func NewPlatformModule(db *sql.DB, cipher *database.DatabasePasswordCipher, secu
 		viewer:         viewer.NewViewerService(effectiveAccess, pools, viewer.NewViewerMetadataRepository()),
 		analysis:       queryanalysis.NewQueryAnalysisService(effectiveAccess, pools),
 		migration:      migration.NewEngine(effectiveAccess, pools, security.Identity),
+		jobs:           migration.NewJobService(db, effectiveAccess, pools, security.Identity),
 		security:       security,
 	}, nil
 }
@@ -73,6 +75,7 @@ func (m *PlatformModule) RegisterRoutes(mux *http.ServeMux) {
 	viewer.RegisterViewerRoutes(mux, viewer.NewViewerHandler(m.viewer))
 	queryanalysis.RegisterQueryAnalysisRoutes(mux, queryanalysis.NewQueryAnalysisHandler(m.analysis, m.security.CSRF))
 	migration.RegisterRoutes(mux, migration.NewHandler(m.migration, m.security.CSRF))
+	migration.RegisterJobRoutes(mux, migration.NewJobHandler(m.jobs, m.security.CSRF))
 	mux.HandleFunc("/api/platform/me", m.handleIdentity)
 }
 func (m *PlatformModule) Close() error {

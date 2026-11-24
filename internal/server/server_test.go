@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const password = "test-password-long-enough"
@@ -165,9 +166,53 @@ func (f *setup) grant(t *testing.T, user int, level string) int {
 	status(t, f.admin.request("PUT", fmt.Sprintf("/api/admin/groups/%d/database-access/%d", id, f.databaseID), fmt.Sprintf(`{"access_level":%q}`, level), nil), 200)
 	return id
 }
-func (f *setup) execute(b *browser, version int, query string) *httptest.ResponseRecorder {
+
+// Queue through HTTP, fixture the required approvals, run a worker, then read the public detail.
+func (f *setup) submitAndRun(b *browser, body string) (migration.Job, int) {
+	t := b.t
+	t.Helper()
+	path := fmt.Sprintf("/api/databases/%d/migrations/execute", f.databaseID)
+	response := b.request("POST", path, body, map[string]string{"Idempotency-Key": fmt.Sprint(time.Now().UnixNano())})
+	if response.Code != 202 {
+		return migration.Job{}, response.Code
+	}
+	id := objectID(t, response)
+	_, err := f.internal.DB.Exec(`INSERT INTO platform.group_leaders(group_id,user_id)
+ SELECT g.group_id,min(m.user_id) FROM platform.group_database_access g JOIN platform.group_memberships m USING(group_id)
+ WHERE g.database_id=$1 GROUP BY g.group_id ON CONFLICT DO NOTHING`, f.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.internal.DB.Exec(`INSERT INTO platform.job_approvals(job_id,group_id,leader_id)
+ SELECT $1,l.group_id,l.user_id FROM platform.group_leaders l JOIN platform.group_database_access g USING(group_id) WHERE g.database_id=$2`, id, f.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := database.NewDatabasePasswordCipherFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := migration.NewWorker(f.internal.DB, database.NewDatabaseConnectionRepository(f.internal.DB, cipher), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := w.ProcessNext(context.Background()); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	detail := b.request("GET", response.Header().Get("Location"), "", nil)
+	status(t, detail, 200)
+	var p struct{ Data migration.Job }
+	if err = json.Unmarshal(detail.Body.Bytes(), &p); err != nil {
+		t.Fatal(err)
+	}
+	return p.Data, 202
+}
+func (f *setup) expectMigration(b *browser, version int, query string, want migration.JobStatus) {
 	body, _ := json.Marshal(map[string]any{"version": version, "query_sql": query})
-	return b.request("POST", fmt.Sprintf("/api/databases/%d/migrations/execute", f.databaseID), string(body), nil)
+	job, code := f.submitAndRun(b, string(body))
+	if code != 202 || job.Status != want {
+		b.t.Fatalf("HTTP %d job %+v want %s", code, job, want)
+	}
 }
 func TestAuthenticationCSRFAndLogoutIntegration(t *testing.T) {
 	f := fixture(t)
@@ -209,7 +254,7 @@ func TestGroupAccessAndMigrationIntegration(t *testing.T) {
 		t.Fatal("peningkatan izin tidak merotasi session")
 	}
 	status(t, user.request("POST", fmt.Sprintf("/api/databases/%d/migrations/execute", f.databaseID), `{"version":1,"query_sql":"CREATE TABLE x(id INT)","UserID":1}`, nil), 400)
-	status(t, f.execute(user, 1, "CREATE TABLE x(id INT)"), 200)
+	f.expectMigration(user, 1, "CREATE TABLE x(id INT)", "SUCCESS")
 	var actor int
 	if f.roles.Audit.QueryRow(`SELECT executed_by FROM platform_migrations.attempts WHERE status='SUCCESS'`).Scan(&actor) != nil || actor != 2 {
 		t.Fatal("pelaksana bukan identitas session")

@@ -36,6 +36,7 @@ type PlatformAdminAuthorizer interface {
 }
 
 type GroupStore interface {
+	SetLeader(context.Context, int, int) error
 	Create(context.Context, CreateGroupParams) (Group, error)
 	GetByID(context.Context, int) (Group, error)
 	List(context.Context, int, int) ([]Group, error)
@@ -53,6 +54,42 @@ type GroupService struct {
 
 func NewGroupService(store GroupStore, admin PlatformAdminAuthorizer) *GroupService {
 	return &GroupService{store: store, admin: admin}
+}
+
+func (s *GroupService) SetLeader(ctx context.Context, groupID, userID int) error {
+	if err := s.requireAdmin(ctx); err != nil {
+		return err
+	}
+	if groupID <= 0 || userID <= 0 {
+		return ErrInvalidGroupInput
+	}
+	return s.store.SetLeader(ctx, groupID, userID)
+}
+
+func (r *GroupRepository) SetLeader(ctx context.Context, groupID, userID int) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ErrGroupStorage
+	}
+	defer tx.Rollback()
+	var id int
+	if err = tx.QueryRowContext(ctx, `SELECT id FROM platform.groups WHERE id=$1 FOR UPDATE`, groupID).Scan(&id); err != nil {
+		return groupRepositoryError("group leader", err)
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT u.id FROM platform.group_memberships m JOIN platform.users u ON u.id=m.user_id
+		WHERE m.group_id=$1 AND u.id=$2 AND u.is_active FOR SHARE`, groupID, userID).Scan(&id); errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidGroupInput
+	} else if err != nil {
+		return ErrGroupStorage
+	}
+	// Changing leader invalidates approvals from the previous tenure through the FK.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM platform.group_leaders WHERE group_id=$1 AND user_id<>$2`, groupID, userID); err != nil {
+		return ErrGroupStorage
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO platform.group_leaders(group_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, groupID, userID); err != nil {
+		return ErrGroupStorage
+	}
+	return tx.Commit()
 }
 
 func (s *GroupService) requireAdmin(ctx context.Context) error {

@@ -39,10 +39,23 @@
 <section id="panel-migrations" class="panel" aria-labelledby="migration-heading" hidden>
  <h1 id="migration-heading">Migration &amp; history</h1>
  <div class="card"><label>Database<select id="migration-db" disabled><option value="">Pilih database</option></select></label><p id="migration-access" class="muted">Izin diperiksa pada setiap operasi.</p></div>
- <form id="migration-form" class="card"><h2>Editor SQL</h2><label>Versi berikutnya<input id="migration-version" type="number" min="1" max="2147483647" required disabled></label><label>SQL migration<textarea id="migration-sql" rows="12" spellcheck="false" maxlength="12288" required readonly placeholder="CREATE TABLE public.contoh (id BIGINT PRIMARY KEY, nama TEXT);"></textarea></label>
+ <form id="migration-form" class="card"><h2>Editor SQL</h2><label>Operasi<select id="migration-operation"><option value="apply">Migration baru</option><option value="rollback">Rollback job</option><option value="forward">Forward job</option></select></label>
+ <label id="migration-source-label" hidden>ID job sumber<input id="migration-source" type="number" min="1"></label>
+ <label>Versi berikutnya<input id="migration-version" type="number" min="1" max="2147483647" required disabled></label><label>SQL migration<textarea id="migration-sql" rows="12" spellcheck="false" maxlength="12288" required readonly placeholder="CREATE TABLE public.contoh (id BIGINT PRIMARY KEY, nama TEXT);"></textarea></label>
  <label class="check" id="migration-ddl-label" hidden><input id="migration-ddl" type="checkbox">Saya memilih satu DDL MariaDB/MySQL yang tidak dapat di-rollback</label><p id="migration-warning" class="warning" hidden>DDL memakai implicit commit. Perubahan dan history tidak atomik; jika hasil meragukan, status NEEDS_REVIEW memerlukan pemeriksaan akun pencatat sebelum melanjutkan.</p>
- <div class="actions"><button id="migration-run" class="primary" type="submit" disabled>Jalankan migration</button><button id="migration-analyze" type="button" disabled>Analisis SQL ini</button></div><p class="muted">SQL maksimum 12 KiB. Tidak ada draft yang disimpan. Versi gagal dapat dipakai ulang; versi sukses harus meningkat.</p>
- </form><p id="migration-status" role="status">Pilih database untuk melihat history.</p>
+ <label id="migration-down-label">SQL down untuk rollback (opsional)<textarea id="migration-down" maxlength="12288"></textarea></label>
+ <label id="migration-batch-label">Ukuran batch (kosong untuk migration biasa)<input type="number" min="1" max="100000" id="migration-batch" placeholder="Contoh: 5000"></label>
+ <p id="migration-batch-help" hidden>Gunakan UPDATE public.tabel SET kolom = TRUE atau FALSE dengan primary key integer id.</p>
+ <label id="migration-recovery-label" class="check" hidden><input id="migration-recovery" type="checkbox">Siapkan pembatalan batch dengan menyimpan nilai awal setiap row</label>
+ <div class="actions"><button id="migration-run" class="primary" type="submit" disabled>Ajukan migration</button><button id="migration-analyze" type="button" disabled>Analisis SQL ini</button></div><p class="muted">SQL maksimum 12 KiB. Tidak ada draft yang disimpan. Versi gagal dapat dipakai ulang; versi sukses harus meningkat.</p>
+ </form><div class="card"><h2>Pantau dan tinjau job</h2>
+ <label>ID job<input id="migration-job-id" type="number" min="1"></label><button id="migration-monitor" type="button">Buka job</button>
+ <button id="migration-retry" type="button" hidden>Lanjutkan batch dari checkpoint</button>
+ <button id="migration-cancel" type="button" hidden>Ajukan pembatalan batch committed</button>
+ <button id="migration-reconcile" type="button" hidden>Periksa ulang riwayat target</button>
+ <details id="migration-review" hidden><summary>Snapshot untuk persetujuan</summary><pre id="migration-snapshot"></pre>
+ <label>ID grup yang Anda pimpin<input id="migration-group" type="number" min="1"></label><button id="migration-approve" type="button">Setujui untuk grup</button></details>
+ </div><p id="migration-job-status" role="status"></p><p id="migration-status" role="status">Pilih database untuk melihat history.</p>
  <details id="migration-diff" class="card"><summary>Schema diff &amp; kandidat migration</summary><p>Masukkan schema tujuan sebagai JSON. Kandidat tidak dijalankan otomatis. Perubahan berisiko memerlukan keputusan Anda.</p><label>Schema tujuan<textarea id="diff-input" rows="10" spellcheck="false">{"schema":"public","tables":[{"name":"contoh","columns":[{"name":"id","type":"bigint","nullable":false},{"name":"nama","type":"text","nullable":true}]}]}</textarea></label><div class="actions"><button id="diff-generate" type="button" disabled>Bandingkan schema</button><button id="diff-to-editor" type="button" disabled>Salin kandidat ke editor</button></div><div id="diff-changes"></div><pre id="diff-sql"></pre><p id="diff-limitations" class="muted"></p></details>
  <div class="card"><h2>Riwayat percobaan</h2><p class="muted">Diurutkan berdasarkan nomor percobaan terbaru. Versi sukses membentuk urutan perubahan database.</p><div id="migration-history" class="table-scroll" tabindex="0"></div><div class="pager"><button id="history-refresh" type="button">Muat ulang</button><button id="history-prev" type="button" disabled>Sebelumnya</button><button id="history-next" type="button" disabled>Berikutnya</button></div></div>
 </section>
