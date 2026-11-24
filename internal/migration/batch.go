@@ -189,6 +189,17 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 		if err = w.heartbeat(ctx, c); err != nil {
 			return err
 		}
+		if batches > 0 && c.job.Submission.DownSQL != "" {
+			var stop bool
+			err = w.db.QueryRowContext(ctx, `SELECT CASE WHEN j.cancel_waiting THEN a.approved AND a.can_edit AND a.same_target ELSE FALSE END
+				FROM platform.migration_jobs j JOIN platform.job_admission a ON a.id=j.id WHERE j.id=$1 AND j.lease_token=$2`, c.job.ID, c.token).Scan(&stop)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return errPartial
+			}
+		}
 		var keys pq.Int64Array
 		err := audit.QueryRowContext(ctx, `SELECT row_ids FROM platform_migrations.batch_scope
 			WHERE attempt_id=$1 AND batch_no=$2`, id, batches+1).Scan(&keys)
@@ -197,7 +208,7 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 			return err
 		}
 		for retries := 0; ; retries++ {
-			err = commitBatchPage(ctx, conn, token, batches+1, update, keys)
+			err = commitBatchPage(ctx, conn, token, batches+1, update, keys, c.job.Submission)
 			if err == nil {
 				break
 			}
@@ -223,7 +234,7 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 	}
 }
 
-func commitBatchPage(ctx context.Context, conn *sql.Conn, token string, number int64, update string, keys pq.Int64Array) error {
+func commitBatchPage(ctx context.Context, conn *sql.Conn, token string, number int64, update string, keys pq.Int64Array, submission JobSubmission) error {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -232,16 +243,29 @@ func commitBatchPage(ctx context.Context, conn *sql.Conn, token string, number i
 	if len(keys) == 0 {
 		_, err = tx.ExecContext(ctx, "SELECT platform_migrations.complete_attempt($1)", token)
 	} else {
-		res, err := tx.ExecContext(ctx, update, keys)
-		if err != nil {
-			return err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil || affected != int64(len(keys)) {
-			return errors.New("cakupan row berubah")
+		var image string
+		if submission.DownSQL != "" {
+			image, err = captureBatch(ctx, tx, submission.QuerySQL, keys)
+			if err != nil {
+				return err
+			}
+		} else {
+			res, err := tx.ExecContext(ctx, update, keys)
+			if err != nil {
+				return err
+			}
+			affected, err := res.RowsAffected()
+			if err != nil || affected != int64(len(keys)) {
+				return errors.New("cakupan row berubah")
+			}
 		}
 		if _, err = tx.ExecContext(ctx, "SELECT platform_migrations.record_batch($1,$2,$3)", token, number, keys); err != nil {
 			return err
+		}
+		if image != "" {
+			if _, err = tx.ExecContext(ctx, "SELECT platform_migrations.record_recovery($1,$2,$3)", token, number, image); err != nil {
+				return err
+			}
 		}
 	}
 	if err != nil {

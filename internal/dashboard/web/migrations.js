@@ -24,6 +24,7 @@
  }
  let monitorGeneration=0,retry=null,reviewed=null;
  function operationFields(){
+  if(!reviewed)$("migration-cancel").hidden=true;
   const apply=$("migration-operation").value==="apply",pg=selected()?.driver==="postgres";
   $("migration-source-label").hidden=apply;
   $("migration-source").required=!apply;
@@ -31,6 +32,7 @@
   $("migration-sql").closest("label").hidden=!apply;
   $("migration-batch-label").hidden=!apply||!pg;
   $("migration-batch-help").hidden=!apply||!pg||!$("migration-batch").value;
+  $("migration-recovery-label").hidden=$("migration-batch-help").hidden;
   $("migration-down-label").hidden=!apply||(pg&&!!$("migration-batch").value);
  }
  async function monitor(job,ticket){
@@ -38,11 +40,17 @@
   $("migration-job-id").value=job.id;
   while(ticket===monitorGeneration && app.user){
    reviewed=job;
-   $("migration-retry").hidden=!(editable() && job.submission.batch_size>0 && job.attempt_id && ["PARTIAL","FAILED"].includes(job.status));
-   $("migration-review").hidden=job.status!=="QUEUED";
+   const batch=editable() && job.submission.batch_size>0 && job.attempt_id;
+   $("migration-retry").hidden=!(batch && ["PARTIAL","FAILED"].includes(job.status) && (!job.cancel_origin || (job.status==="PARTIAL" && !job.reverted_batches)));
+   $("migration-cancel").hidden=!(batch && job.submission.down_sql && job.committed_batches>0 &&
+    (["SUCCESS","PARTIAL","PARTIALLY_REVERTED"].includes(job.status) || (!job.cancel_origin && job.status==="RUNNING") || (job.cancel_origin && job.status==="NEEDS_REVIEW")));
+   $("migration-cancel").textContent=job.reverted_batches?"Lanjutkan pembatalan batch":"Ajukan pembatalan batch committed";
+   $("migration-review").hidden=job.status!=="QUEUED" && !job.cancel_waiting;
    $("migration-snapshot").textContent=JSON.stringify(job.submission,null,2);
-   const round=job.retry_count ? ` · Retry #${job.retry_count}` : "";
-   $("migration-job-status").textContent=`Job #${job.id}${round} · ${job.status} · ${job.committed_batches} batch, ${job.committed_rows} row committed ${job.error_code||""}`;
+   const round=job.retry_count ? ` · ${job.cancel_origin?"Pembatalan":"Retry"} #${job.retry_count}` : "";
+   const restored=job.cancel_origin ? ` · Dipulihkan: ${job.reverted_batches} batch, ${job.reverted_rows} row` : "";
+   const issue=job.error_code==="unsafe_revert"?"Pembatalan tidak aman. Ajukan migration perbaikan.":job.error_code||"";
+   $("migration-job-status").textContent=`Job #${job.id}${round} · ${job.status} · ${job.committed_batches} batch, ${job.committed_rows} row committed${restored} ${issue}`;
    if(!["QUEUED","RUNNING","READY"].includes(job.status)){await history(true);return;}
    await new Promise(resolve=>setTimeout(resolve,1500));
    if(ticket!==monitorGeneration)return;
@@ -57,6 +65,7 @@
    body.query_sql=$("migration-sql").value;
    body.batch_size=selected()?.driver==="postgres"?Number($("migration-batch").value):0;
    body.down_sql=body.batch_size?"":$("migration-down").value;
+   if(body.batch_size && $("migration-recovery").checked)body.prepare_cancellation=true;
    body.non_atomic_ddl=selected()?.driver!=="postgres"&&$("migration-ddl").checked;
   }else{body.source_job=Number($("migration-source").value);}
   const fingerprint=path+JSON.stringify(body);
@@ -72,7 +81,7 @@
  async function diff(){if(!editable())throw new Error("Akses View + Edit diperlukan.");let input;try{input=JSON.parse($("diff-input").value);}catch{throw new Error("Schema tujuan harus berupa JSON valid.");}const request=scope();candidate="";permissions();const result=await app.api(`${base()}/diff`,{method:"POST",body:input,signal:request.signal});if(request.ticket!==generation)return;candidate=result.sql;$("diff-sql").textContent=candidate||"Tidak ada SQL tambahan yang dapat dihasilkan otomatis.";$("diff-limitations").textContent=result.limitations;app.table($("diff-changes"),[{label:"Objek",value:d=>d.object},{label:"Perbedaan",value:d=>d.kind},{label:"Keputusan",value:d=>`${d.requires_decision?"Perlu keputusan: ":""}${d.message}`}],result.differences,"Tidak ada perbedaan pada cakupan yang didukung.");permissions();}
  document.addEventListener("DOMContentLoaded",()=>{
   $("migration-monitor").addEventListener("click",()=>app.action(async()=>{
-   const ticket=++monitorGeneration;reviewed=null;$("migration-review").hidden=true;$("migration-retry").hidden=true;
+   const ticket=++monitorGeneration;reviewed=null;$("migration-review").hidden=true;$("migration-retry").hidden=true;$("migration-cancel").hidden=true;
    const job=await app.api(base()+"/jobs/"+encodeURIComponent($("migration-job-id").value));
    await monitor(job,ticket);
   }));
@@ -83,8 +92,15 @@
    const queued=await app.api(job.status_url+"/retries/"+(job.retry_count+1),{method:"PUT"});
    await monitor(queued,ticket);
   },$("migration-retry")));
+  $("migration-cancel").addEventListener("click",()=>app.action(async()=>{
+   const job=reviewed;
+   if(!job||!editable())return;
+   const ticket=++monitorGeneration;
+   const queued=await app.api(job.status_url+"/cancellations/"+(job.retry_count+1),{method:"PUT"});
+   await monitor(queued,ticket);
+  },$("migration-cancel")));
   $("migration-approve").addEventListener("click",()=>app.action(async()=>{
-   if(!reviewed||reviewed.status!=="QUEUED")return;
+   if(!reviewed||(reviewed.status!=="QUEUED"&&!reviewed.cancel_waiting))return;
    const group=Number($("migration-group").value);
    if(!Number.isSafeInteger(group)||group<=0)throw new Error("Masukkan ID grup leader.");
    await app.api(reviewed.status_url+"/approvals/"+group+"?retry_count="+reviewed.retry_count,{method:"PUT"});

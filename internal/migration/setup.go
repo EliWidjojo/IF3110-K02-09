@@ -44,6 +44,11 @@ func SetupPostgresHistory(ctx context.Context, db *sql.DB, executor string) erro
   batch_no BIGINT NOT NULL, cursor_id BIGINT NOT NULL, row_ids BIGINT[] NOT NULL,
   PRIMARY KEY(attempt_id,batch_no));
  ALTER TABLE platform_migrations.attempts ADD COLUMN IF NOT EXISTS batch_scope_ready BOOLEAN NOT NULL DEFAULT FALSE;
+ ALTER TABLE platform_migrations.attempts DROP CONSTRAINT IF EXISTS attempts_status_check;
+ ALTER TABLE platform_migrations.attempts ADD CONSTRAINT attempts_status_check CHECK(status IN ('RUNNING','SUCCESS','FAILED','INTERRUPTED','NEEDS_REVIEW','REVERTED'));
+ ALTER TABLE platform_migrations.batch_checkpoints ADD COLUMN IF NOT EXISTS recovery JSONB,
+   ADD COLUMN IF NOT EXISTS reverted_at TIMESTAMPTZ;
+ CREATE INDEX IF NOT EXISTS batch_pending_revert ON platform_migrations.batch_checkpoints(attempt_id,batch_no) WHERE reverted_at IS NULL;
  CREATE TABLE IF NOT EXISTS platform_migrations.batch_scope(
   attempt_id BIGINT NOT NULL REFERENCES platform_migrations.attempts(id),
   batch_no BIGINT NOT NULL CHECK(batch_no > 0),
@@ -61,10 +66,35 @@ func SetupPostgresHistory(ctx context.Context, db *sql.DB, executor string) erro
       WHERE attempt_id=attempt AND batch_no=n-1))) THEN
    RAISE EXCEPTION 'batch checkpoint does not match scope';
   END IF;
-  INSERT INTO platform_migrations.batch_checkpoints VALUES(attempt,n,keys[cardinality(keys)],keys);
+  INSERT INTO platform_migrations.batch_checkpoints(attempt_id,batch_no,cursor_id,row_ids) VALUES(attempt,n,keys[cardinality(keys)],keys);
  END $body$;
  REVOKE ALL ON FUNCTION platform_migrations.record_batch(TEXT,BIGINT,BIGINT[]) FROM PUBLIC;
  GRANT EXECUTE ON FUNCTION platform_migrations.record_batch(TEXT,BIGINT,BIGINT[]) TO %s;
+ CREATE OR REPLACE FUNCTION platform_migrations.record_recovery(token TEXT,n BIGINT,image JSONB) RETURNS VOID
+ LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $body$
+ BEGIN
+  UPDATE platform_migrations.batch_checkpoints c SET recovery=image FROM platform_migrations.attempts a
+  WHERE a.capability_hash=sha256(convert_to(token,'UTF8')) AND a.status='RUNNING' AND a.id=c.attempt_id
+    AND c.batch_no=n AND c.recovery IS NULL AND c.row_ids=ARRAY(
+      SELECT (entry->>'id')::bigint FROM jsonb_array_elements(image) WITH ORDINALITY AS saved(entry,ord) ORDER BY ord);
+  IF NOT FOUND THEN RAISE EXCEPTION 'recovery checkpoint rejected'; END IF;
+ END $body$;
+ CREATE OR REPLACE FUNCTION platform_migrations.record_revert(token TEXT,n BIGINT) RETURNS VOID
+ LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $body$
+ DECLARE attempt BIGINT;
+ BEGIN
+  SELECT id INTO STRICT attempt FROM platform_migrations.attempts WHERE status='NEEDS_REVIEW' AND error_code='reverting_batch'
+    AND capability_hash=sha256(convert_to(token,'UTF8')) FOR UPDATE;
+  UPDATE platform_migrations.batch_checkpoints SET reverted_at=clock_timestamp()
+   WHERE attempt_id=attempt AND batch_no=n AND reverted_at IS NULL AND recovery IS NOT NULL
+   AND n=(SELECT max(batch_no) FROM platform_migrations.batch_checkpoints WHERE attempt_id=attempt AND reverted_at IS NULL);
+  IF NOT FOUND THEN RAISE EXCEPTION 'revert checkpoint rejected'; END IF;
+  IF n=1 THEN
+   UPDATE platform_migrations.attempts SET status='REVERTED',error_code='',finished_at=clock_timestamp(),capability_hash=NULL WHERE id=attempt;
+  END IF;
+ END $body$;
+ REVOKE ALL ON FUNCTION platform_migrations.record_recovery(TEXT,BIGINT,JSONB),platform_migrations.record_revert(TEXT,BIGINT) FROM PUBLIC;
+ GRANT EXECUTE ON FUNCTION platform_migrations.record_recovery(TEXT,BIGINT,JSONB),platform_migrations.record_revert(TEXT,BIGINT) TO %s;
  REVOKE ALL ON ALL TABLES IN SCHEMA platform_migrations FROM PUBLIC;
  REVOKE ALL ON ALL SEQUENCES IN SCHEMA platform_migrations FROM PUBLIC;
  CREATE OR REPLACE VIEW platform_migrations.history AS SELECT id,version,executed_by,executed_at,finished_at,status,query_sql,sql_state,error_code FROM platform_migrations.attempts;
@@ -80,7 +110,7 @@ func SetupPostgresHistory(ctx context.Context, db *sql.DB, executor string) erro
  GRANT USAGE ON SCHEMA platform_migrations TO %s;
  GRANT SELECT ON platform_migrations.history TO %s;
  GRANT EXECUTE ON FUNCTION platform_migrations.complete_attempt(TEXT) TO %s;
- `, pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor)))
+ `, pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor), pq.QuoteIdentifier(executor)))
 	if err != nil {
 		return err
 	}

@@ -42,7 +42,7 @@ func (w *Worker) claim(ctx context.Context) (claim, error) {
 	token := hex.EncodeToString(secret[:])
 	j, err := scanJob(w.db.QueryRowContext(ctx, `WITH candidate AS (
 	 SELECT j.id FROM platform.migration_jobs j JOIN platform.job_admission a ON a.id=j.id
-	 WHERE (j.status IN ('QUEUED','READY') AND a.approved) OR
+	 WHERE (j.status IN ('QUEUED','READY') AND (a.approved OR j.cancel_waiting)) OR
 	       (j.status='RUNNING' AND j.lease_token IS NOT NULL AND j.lease_until <= clock_timestamp())
 	 ORDER BY j.updated_at,j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1
 	)
@@ -118,12 +118,25 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		return err
 	}
 	finish := func(status JobStatus, code string) error {
+		if c.job.CancelOrigin != "" && status == JobFailed {
+			status = JobNeedsReview
+			if c.job.RevertedBatches > 0 {
+				status = JobPartiallyReverted
+			}
+		}
 		if c.job.retryPending && status == JobFailed && c.job.CommittedBatches > 0 {
 			status = JobPartial
 		}
-		res, err := tx.ExecContext(ctx, `UPDATE platform.migration_jobs SET status=$3,error_code=$4,
+		// A cancellation may arrive after the last batch boundary. Publish
+		// the actual forward outcome and hand off under the same job row lock.
+		res, err := tx.ExecContext(ctx, `UPDATE platform.migration_jobs SET
+		 status=CASE WHEN cancel_waiting AND $3 IN ('PARTIAL','SUCCESS') THEN 'QUEUED' ELSE $3 END,
+		 cancel_origin=CASE WHEN cancel_waiting AND $3 IN ('PARTIAL','SUCCESS') THEN $3 ELSE cancel_origin END,
+		 cancel_waiting=(cancel_waiting AND $3='QUEUED'),
+		 error_code=CASE WHEN cancel_waiting AND $3 IN ('PARTIAL','SUCCESS') THEN '' ELSE $4 END,
 		 retry_pending=(retry_pending AND $3='QUEUED'),
-		 lease_token=NULL,lease_until=NULL,finished_at=CASE WHEN $3 IN ('FAILED','SUCCESS','PARTIAL','NEEDS_REVIEW') THEN clock_timestamp() ELSE NULL END
+		 lease_token=NULL,lease_until=NULL,finished_at=CASE WHEN cancel_waiting AND $3 IN ('PARTIAL','SUCCESS') THEN NULL
+		 WHEN $3 IN ('FAILED','SUCCESS','PARTIAL','NEEDS_REVIEW','REVERTED','PARTIALLY_REVERTED') THEN clock_timestamp() ELSE NULL END
 		 WHERE `+ownsLease, c.job.ID, c.token, status, code)
 		if err = checkOwner(res, err); err != nil {
 			return err
@@ -145,7 +158,7 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	}
 	if code, err := admission(); err != nil {
 		return err
-	} else if code != "" && (c.job.AttemptID == nil || c.job.retryPending || code == "target_changed") {
+	} else if code != "" && (c.job.AttemptID == nil || c.job.retryPending || (c.job.CancelOrigin != "" && !c.job.CancelWaiting) || code == "target_changed") {
 		return check(code)
 	}
 	if err = ValidateSubmission(ctx, c.job.Submission, c.job.Driver, "preflight"); err != nil {
@@ -234,6 +247,20 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		return finish(JobNeedsReview, "outcome_unknown")
 	}
 	if c.job.AttemptID != nil {
+		if c.job.CancelWaiting {
+			return reconcile("interrupted")
+		}
+		if c.job.CancelOrigin != "" {
+			if code, err := admission(); err != nil {
+				return err
+			} else if code != "" {
+				return check(code)
+			}
+			if c.job.Submission.BatchSize == 0 || c.job.Submission.DownSQL == "" {
+				return finish(JobNeedsReview, "unsafe_revert")
+			}
+			return finish(w.cancelBatch(ctx, c, target, control))
+		}
 		if c.job.retryPending {
 			if code, err := admission(); err != nil {
 				return err

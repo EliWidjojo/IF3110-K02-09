@@ -21,20 +21,23 @@ import (
 type JobStatus string
 
 const (
-	JobQueued      JobStatus = "QUEUED"
-	JobRunning     JobStatus = "RUNNING"
-	JobPartial     JobStatus = "PARTIAL"
-	JobReady       JobStatus = "READY"
-	JobSuccess     JobStatus = "SUCCESS"
-	JobFailed      JobStatus = "FAILED"
-	JobNeedsReview JobStatus = "NEEDS_REVIEW"
+	JobQueued            JobStatus = "QUEUED"
+	JobRunning           JobStatus = "RUNNING"
+	JobPartial           JobStatus = "PARTIAL"
+	JobReady             JobStatus = "READY"
+	JobSuccess           JobStatus = "SUCCESS"
+	JobFailed            JobStatus = "FAILED"
+	JobNeedsReview       JobStatus = "NEEDS_REVIEW"
+	JobPartiallyReverted JobStatus = "PARTIALLY_REVERTED"
+	JobReverted          JobStatus = "REVERTED"
 )
 
 var (
-	ErrJobNotFound   = errors.New("job tidak ditemukan pada database ini")
-	ErrJobConflict   = errors.New("idempotency key sudah digunakan untuk pengajuan berbeda")
-	ErrRetryConflict = errors.New("retry tidak berlaku untuk target, status job, atau nomor retry ini")
-	ErrJobStorage    = errors.New("penyimpanan job tidak tersedia")
+	ErrJobNotFound    = errors.New("job tidak ditemukan pada database ini")
+	ErrJobConflict    = errors.New("idempotency key sudah digunakan untuk pengajuan berbeda")
+	ErrRetryConflict  = errors.New("retry tidak berlaku untuk target, status job, atau nomor retry ini")
+	ErrCancelConflict = errors.New("pembatalan memerlukan batch committed dan SQL pemulihan yang sudah disetujui; jika tidak tersedia, ajukan migration perbaikan")
+	ErrJobStorage     = errors.New("penyimpanan job tidak tersedia")
 )
 
 // JobSubmission merupakan snapshot input, bukan referensi ke revision yang dapat berubah.
@@ -50,7 +53,11 @@ type JobSubmission struct {
 }
 
 type Job struct {
-	RetryCount       int64 `json:"retry_count"`
+	CancelOrigin     JobStatus `json:"cancel_origin,omitempty"`
+	CancelWaiting    bool      `json:"cancel_waiting,omitempty"`
+	RevertedBatches  int64     `json:"reverted_batches"`
+	RevertedRows     int64     `json:"reverted_rows"`
+	RetryCount       int64     `json:"retry_count"`
 	retryPending     bool
 	AttemptID        *int64           `json:"attempt_id"`
 	CommittedBatches int64            `json:"committed_batches"`
@@ -101,10 +108,10 @@ func ValidateSubmission(ctx context.Context, req JobSubmission, driver database.
 	if req.Version <= 0 || req.Version > 2147483647 || len(req.QuerySQL) > 12288 || !utf8.ValidString(req.QuerySQL) || strings.ContainsRune(req.QuerySQL, 0) {
 		return &InputError{"versi atau ukuran/encoding SQL tidak valid (maksimum 12 KiB)"}
 	}
-	if req.BatchSize < 0 || req.BatchSize > 100000 || (req.BatchSize > 0 && (driver != database.Postgres || batchUpdate.FindStringSubmatch(req.QuerySQL) == nil || req.DownSQL != "")) {
+	if req.BatchSize < 0 || req.BatchSize > 100000 || (req.BatchSize > 0 && (driver != database.Postgres || batchUpdate.FindStringSubmatch(req.QuerySQL) == nil || (req.DownSQL != "" && req.DownSQL != batchRestoreSQL(req.QuerySQL)))) {
 		return &InputError{"batch memerlukan PostgreSQL, ukuran 1-100000, dan UPDATE public.tabel SET kolom = TRUE atau FALSE"}
 	}
-	if req.DownSQL != "" {
+	if req.DownSQL != "" && req.BatchSize == 0 {
 		down := JobSubmission{Version: req.Version, QuerySQL: req.DownSQL, NonAtomicDDL: req.NonAtomicDDL}
 		if err := ValidateSubmission(ctx, down, driver, key); err != nil {
 			return err
@@ -169,13 +176,13 @@ func (s *JobService) SubmitJob(ctx context.Context, databaseID int, key string, 
 }
 
 const jobColumns = `id, database_id, submitted_by, version, query_sql, non_atomic_ddl,
-	driver, status, worker_id, created_at, updated_at, started_at, finished_at, error_code, heartbeat_at, lease_until, batch_size, down_sql, operation, source_job, attempt_id, committed_batches, committed_rows, retry_count, retry_pending`
+	driver, status, worker_id, created_at, updated_at, started_at, finished_at, error_code, heartbeat_at, lease_until, batch_size, down_sql, operation, source_job, attempt_id, committed_batches, committed_rows, retry_count, retry_pending, cancel_origin, reverted_batches, reverted_rows,cancel_waiting`
 
 func scanJob(row interface{ Scan(...any) error }) (Job, error) {
 	var j Job
 	err := row.Scan(&j.ID, &j.DatabaseID, &j.SubmittedBy, &j.Submission.Version,
 		&j.Submission.QuerySQL, &j.Submission.NonAtomicDDL, &j.Driver, &j.Status,
-		&j.WorkerID, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt, &j.ErrorCode, &j.HeartbeatAt, &j.LeaseUntil, &j.Submission.BatchSize, &j.Submission.DownSQL, &j.Submission.Operation, &j.Submission.SourceJob, &j.AttemptID, &j.CommittedBatches, &j.CommittedRows, &j.RetryCount, &j.retryPending)
+		&j.WorkerID, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt, &j.ErrorCode, &j.HeartbeatAt, &j.LeaseUntil, &j.Submission.BatchSize, &j.Submission.DownSQL, &j.Submission.Operation, &j.Submission.SourceJob, &j.AttemptID, &j.CommittedBatches, &j.CommittedRows, &j.RetryCount, &j.retryPending, &j.CancelOrigin, &j.RevertedBatches, &j.RevertedRows, &j.CancelWaiting)
 	j.StatusURL = fmt.Sprintf("/api/databases/%d/migrations/jobs/%d", j.DatabaseID, j.ID)
 	return j, err
 }
@@ -230,6 +237,10 @@ type JobHandler struct {
 // RetryBatch queues the same immutable submission and starts a new approval round.
 // Numbered requests make a lost HTTP response safe to replay after the worker finishes.
 func (s *JobService) RetryBatch(ctx context.Context, databaseID int, jobID, number int64) (Job, error) {
+	return s.queueBatchAction(ctx, databaseID, jobID, number, false)
+}
+
+func (s *JobService) queueBatchAction(ctx context.Context, databaseID int, jobID, number int64, cancelBatch bool) (Job, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if databaseID <= 0 || jobID <= 0 || number <= 0 {
@@ -255,22 +266,42 @@ func (s *JobService) RetryBatch(ctx context.Context, databaseID int, jobID, numb
 	if err != nil {
 		return Job{}, ErrJobStorage
 	}
-	if number <= j.RetryCount {
+	if number <= j.RetryCount && cancelBatch == (j.CancelOrigin != "") {
 		return j, nil
 	}
-	if number != j.RetryCount+1 || j.AttemptID == nil || j.Submission.BatchSize == 0 ||
+	origin := j.CancelOrigin
+	waitForBatch := cancelBatch && origin == "" && j.Status == JobRunning
+	if cancelBatch {
+		eligible := waitForBatch || j.Status == JobPartial || j.Status == JobSuccess || j.Status == JobPartiallyReverted ||
+			(origin != "" && j.Status == JobNeedsReview)
+		if !eligible || number != j.RetryCount+1 || j.AttemptID == nil || j.CommittedBatches == 0 ||
+			j.Submission.BatchSize == 0 || j.Submission.DownSQL == "" {
+			return Job{}, ErrCancelConflict
+		}
+		if waitForBatch {
+			origin = JobPartial
+		} else if origin == "" {
+			origin = j.Status
+		}
+	} else if (origin != "" && (j.Status != JobPartial || j.RevertedBatches != 0)) || number != j.RetryCount+1 || j.AttemptID == nil || j.Submission.BatchSize == 0 ||
 		(j.Status != JobPartial && j.Status != JobFailed) {
 		return Job{}, ErrRetryConflict
+	} else {
+		origin = ""
 	}
 	if err := ValidateSubmission(ctx, j.Submission, j.Driver, "retry"); err != nil {
 		return Job{}, err
 	}
 	j, err = scanJob(tx.QueryRowContext(ctx, `UPDATE platform.migration_jobs
-		SET retry_count=$2,retry_pending=TRUE,retry_requested_by=$3,status='QUEUED',
-		    finished_at=NULL,worker_id=NULL,heartbeat_at=NULL,error_code=''
+		SET retry_count=$2,retry_pending=$4,retry_requested_by=$3,cancel_origin=$5,cancel_waiting=$6,
+		    status=CASE WHEN $6 THEN status ELSE 'QUEUED' END,finished_at=NULL,
+		    worker_id=CASE WHEN $6 THEN worker_id END,heartbeat_at=CASE WHEN $6 THEN heartbeat_at END,error_code=''
 		WHERE id=$1 AND EXISTS (SELECT 1 FROM platform.job_admission WHERE id=$1 AND same_target)
-		RETURNING `+jobColumns, jobID, number, actor))
+		RETURNING `+jobColumns, jobID, number, actor, !cancelBatch, origin, waitForBatch))
 	if errors.Is(err, sql.ErrNoRows) {
+		if cancelBatch {
+			return Job{}, ErrCancelConflict
+		}
 		return Job{}, ErrRetryConflict
 	}
 	if err != nil {
@@ -290,6 +321,7 @@ func NewJobHandler(service *JobService, csrf admin.UserCSRFVerifier) *JobHandler
 }
 
 func RegisterJobRoutes(mux *http.ServeMux, h *JobHandler) {
+	mux.HandleFunc("PUT /api/databases/{database_id}/migrations/jobs/{job_id}/cancellations/{number}", func(w http.ResponseWriter, r *http.Request) { h.handleBatchAction(w, r, true) })
 	mux.HandleFunc("PUT /api/databases/{database_id}/migrations/jobs/{job_id}/retries/{number}", h.HandleRetryBatch)
 	mux.HandleFunc("PUT /api/databases/{database_id}/migrations/jobs/{job_id}/approvals/{group_id}", h.HandleApprove)
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/execute", h.HandleSubmitJob)
@@ -298,6 +330,10 @@ func RegisterJobRoutes(mux *http.ServeMux, h *JobHandler) {
 }
 
 func (h *JobHandler) HandleRetryBatch(w http.ResponseWriter, r *http.Request) {
+	h.handleBatchAction(w, r, false)
+}
+
+func (h *JobHandler) handleBatchAction(w http.ResponseWriter, r *http.Request, cancelBatch bool) {
 	if h.csrf == nil || h.csrf.ValidateCSRF(r) != nil {
 		admin.WriteUserServiceError(w, admin.ErrInvalidUserCSRF)
 		return
@@ -309,7 +345,7 @@ func (h *JobHandler) HandleRetryBatch(w http.ResponseWriter, r *http.Request) {
 		writeJobError(w, &InputError{"ID database, job, atau nomor retry tidak valid"})
 		return
 	}
-	j, err := h.service.RetryBatch(r.Context(), dbID, jobID, number)
+	j, err := h.service.queueBatchAction(r.Context(), dbID, jobID, number, cancelBatch)
 	if err != nil {
 		writeJobError(w, err)
 		return
@@ -348,7 +384,8 @@ func (h *JobHandler) HandleApprove(w http.ResponseWriter, r *http.Request) {
 	 JOIN platform.group_database_access g ON g.database_id=j.database_id
 	 JOIN platform.group_leaders l ON l.group_id=g.group_id
 	 JOIN platform.users u ON u.id=l.user_id
-	 WHERE j.database_id=$1 AND j.id=$2 AND l.group_id=$3 AND l.user_id=$4 AND u.is_active AND j.status='QUEUED' AND j.retry_count=$5
+	 WHERE j.database_id=$1 AND j.id=$2 AND l.group_id=$3 AND l.user_id=$4 AND u.is_active
+	 AND (j.status='QUEUED' OR (j.status='RUNNING' AND j.cancel_waiting)) AND j.retry_count=$5
 	 FOR SHARE OF j,g,l,u
 	), saved AS (INSERT INTO platform.job_approvals(job_id,group_id,leader_id)
 	 SELECT id,group_id,user_id FROM eligible ON CONFLICT DO NOTHING)
@@ -383,11 +420,21 @@ func (h *JobHandler) HandleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, httpapi.MaxRequestBytes)
-	var req JobSubmission
+	var req struct {
+		JobSubmission
+		PrepareCancellation bool `json:"prepare_cancellation"`
+	}
 	if !httpapi.DecodeJSON(w, r, &req) {
 		return
 	}
-	j, err := h.service.SubmitJob(r.Context(), databaseID, r.Header.Get("Idempotency-Key"), req)
+	if req.PrepareCancellation {
+		if req.BatchSize <= 0 || req.DownSQL != "" || batchRestoreSQL(req.QuerySQL) == "" {
+			writeJobError(w, &InputError{"pemulihan hanya tersedia untuk template UPDATE batch"})
+			return
+		}
+		req.DownSQL = batchRestoreSQL(req.QuerySQL)
+	}
+	j, err := h.service.SubmitJob(r.Context(), databaseID, r.Header.Get("Idempotency-Key"), req.JobSubmission)
 	if err != nil {
 		writeJobError(w, err)
 		return
@@ -425,6 +472,8 @@ func jobDatabaseID(r *http.Request) (int, error) {
 
 func writeJobError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrCancelConflict):
+		httpapi.WriteJSON(w, 409, nil, &httpapi.Error{Code: "cancel_conflict", Message: err.Error()})
 	case errors.Is(err, ErrRetryConflict):
 		httpapi.WriteJSON(w, 409, nil, &httpapi.Error{Code: "retry_conflict", Message: ErrRetryConflict.Error()})
 	case errors.Is(err, ErrJobNotFound):

@@ -132,13 +132,17 @@ ALTER TABLE platform.migration_jobs
  ADD COLUMN IF NOT EXISTS committed_rows BIGINT NOT NULL DEFAULT 0,
  ADD COLUMN IF NOT EXISTS retry_count BIGINT NOT NULL DEFAULT 0,
  ADD COLUMN IF NOT EXISTS retry_pending BOOLEAN NOT NULL DEFAULT FALSE,
+ ADD COLUMN IF NOT EXISTS cancel_origin TEXT NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS cancel_waiting BOOLEAN NOT NULL DEFAULT FALSE,
+ ADD COLUMN IF NOT EXISTS reverted_batches BIGINT NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS reverted_rows BIGINT NOT NULL DEFAULT 0,
  ADD COLUMN IF NOT EXISTS retry_requested_by INT REFERENCES platform.users(id),
  ADD COLUMN IF NOT EXISTS lease_token TEXT,
  ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
  ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
 ALTER TABLE platform.migration_jobs DROP CONSTRAINT IF EXISTS migration_jobs_status_check;
 ALTER TABLE platform.migration_jobs ADD CONSTRAINT migration_jobs_status_check
- CHECK (status IN ('QUEUED','RUNNING','READY','PARTIAL','SUCCESS','FAILED','NEEDS_REVIEW'));
+ CHECK (status IN ('QUEUED','RUNNING','READY','PARTIAL','SUCCESS','FAILED','NEEDS_REVIEW','PARTIALLY_REVERTED','REVERTED'));
 -- Existing jobs intentionally retain NULL: their original destination cannot be reconstructed.
 CREATE OR REPLACE FUNCTION platform.capture_job_target() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
