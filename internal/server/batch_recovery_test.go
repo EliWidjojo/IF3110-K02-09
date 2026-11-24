@@ -21,7 +21,11 @@ type batchRun struct {
 
 func newBatchRun(t *testing.T) *batchRun {
 	t.Helper()
-	f := fixture(t)
+	return jobRunForTarget(t, fixture(t))
+}
+
+func jobRunForTarget(t *testing.T, f *setup) *batchRun {
+	t.Helper()
 	group := f.grant(t, 2, "View + Edit")
 	status(t, f.admin.request("PUT", fmt.Sprintf("/api/admin/groups/%d/leader", group), `{"user_id":2}`, nil), 204)
 	b := &browser{t: t, handler: f.handler}
@@ -30,10 +34,15 @@ func newBatchRun(t *testing.T) *batchRun {
 }
 
 func (r *batchRun) submit() {
+	r.b.t.Helper()
+	r.submitJob(`{"version":1,"batch_size":2,"query_sql":"UPDATE public.items SET done = TRUE","prepare_cancellation":true}`, "recover-items")
+}
+
+func (r *batchRun) submitJob(body, key string) {
 	t := r.b.t
 	t.Helper()
 	resp := r.b.request("POST", fmt.Sprintf("/api/databases/%d/migrations/jobs", r.databaseID),
-		`{"version":1,"batch_size":2,"query_sql":"UPDATE public.items SET done = TRUE","prepare_cancellation":true}`, map[string]string{"Idempotency-Key": "recover-items"})
+		body, map[string]string{"Idempotency-Key": key})
 	status(t, resp, 202)
 	r.path = resp.Header().Get("Location")
 	r.approve(0)

@@ -11,7 +11,8 @@ import (
 	"testing"
 )
 
-func TestMariaDBCompleteFlow(t *testing.T) {
+func mariaTarget(t *testing.T) (*setup, *testutil.MySQL) {
+	t.Helper()
 	f := fixture(t)
 	m := testutil.NewMySQL(t)
 	if err := migration.SetupMySQLHistory(context.Background(), m.Audit, m.Name, m.ExecutorName+"@"+m.AccountHost); err != nil {
@@ -22,6 +23,11 @@ func TestMariaDBCompleteFlow(t *testing.T) {
 	w := f.admin.request("POST", "/api/admin/databases", string(body), nil)
 	status(t, w, 201)
 	f.databaseID = objectID(t, w)
+	return f, m
+}
+
+func TestMariaDBCompleteFlow(t *testing.T) {
+	f, m := mariaTarget(t)
 	group := f.grant(t, 2, "View + Edit")
 	b := &browser{t: t, handler: f.handler}
 	b.login("alice")
@@ -39,7 +45,7 @@ func TestMariaDBCompleteFlow(t *testing.T) {
 	for _, path := range []string{fmt.Sprintf("/api/viewer/databases/%d/schemas", f.databaseID), fmt.Sprintf("/api/viewer/databases/%d/schemas/%s/tables", f.databaseID, m.Name), base} {
 		status(t, b.request("GET", path, "", nil), 200)
 	}
-	w = b.request("GET", base+"/data", "", nil)
+	w := b.request("GET", base+"/data", "", nil)
 	status(t, w, 200)
 	for _, want := range []string{"9007199254740993", "12345678901234567890.123", "/wA="} {
 		if !strings.Contains(w.Body.String(), want) {
