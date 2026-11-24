@@ -43,12 +43,24 @@ func SetupPostgresHistory(ctx context.Context, db *sql.DB, executor string) erro
   attempt_id BIGINT NOT NULL REFERENCES platform_migrations.attempts(id),
   batch_no BIGINT NOT NULL, cursor_id BIGINT NOT NULL, row_ids BIGINT[] NOT NULL,
   PRIMARY KEY(attempt_id,batch_no));
+ ALTER TABLE platform_migrations.attempts ADD COLUMN IF NOT EXISTS batch_scope_ready BOOLEAN NOT NULL DEFAULT FALSE;
+ CREATE TABLE IF NOT EXISTS platform_migrations.batch_scope(
+  attempt_id BIGINT NOT NULL REFERENCES platform_migrations.attempts(id),
+  batch_no BIGINT NOT NULL CHECK(batch_no > 0),
+  row_ids BIGINT[] NOT NULL CHECK(cardinality(row_ids) > 0),
+  PRIMARY KEY(attempt_id,batch_no));
  CREATE OR REPLACE FUNCTION platform_migrations.record_batch(token TEXT, n BIGINT, keys BIGINT[]) RETURNS VOID
  LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $body$
- DECLARE attempt BIGINT;
+ DECLARE attempt BIGINT; frozen BOOLEAN;
  BEGIN
-  SELECT id INTO STRICT attempt FROM platform_migrations.attempts WHERE status='RUNNING'
+  SELECT id,batch_scope_ready INTO STRICT attempt,frozen FROM platform_migrations.attempts WHERE status='RUNNING'
    AND capability_hash=pg_catalog.sha256(pg_catalog.convert_to(token,'UTF8')) FOR UPDATE;
+  IF frozen AND (NOT EXISTS (SELECT 1 FROM platform_migrations.batch_scope
+      WHERE attempt_id=attempt AND batch_no=n AND row_ids=keys)
+    OR (n>1 AND NOT EXISTS (SELECT 1 FROM platform_migrations.batch_checkpoints
+      WHERE attempt_id=attempt AND batch_no=n-1))) THEN
+   RAISE EXCEPTION 'batch checkpoint does not match scope';
+  END IF;
   INSERT INTO platform_migrations.batch_checkpoints VALUES(attempt,n,keys[cardinality(keys)],keys);
  END $body$;
  REVOKE ALL ON FUNCTION platform_migrations.record_batch(TEXT,BIGINT,BIGINT[]) FROM PUBLIC;

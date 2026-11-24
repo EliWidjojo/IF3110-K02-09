@@ -16,14 +16,78 @@ var errPartial = errors.New("sebagian batch sudah committed")
 // the selected primary keys without rewriting arbitrary user SQL.
 var batchUpdate = regexp.MustCompile("(?i)^\\s*UPDATE\\s+public\\.([a-z_][a-z0-9_]{0,62})\\s+SET\\s+([a-z_][a-z0-9_]{0,62})\\s*=\\s*(TRUE|FALSE)\\s*;?\\s*$")
 
+func committedProgress(ctx context.Context, audit *sql.Conn, id int64) (batches, rows int64, err error) {
+	err = audit.QueryRowContext(ctx, `SELECT coalesce(max(batch_no),0),coalesce(sum(cardinality(row_ids)),0)
+		FROM platform_migrations.batch_checkpoints WHERE attempt_id=$1`, id).Scan(&batches, &rows)
+	return
+}
+
 func (w *Worker) syncProgress(ctx context.Context, c *claim, audit *sql.Conn, id int64) error {
-	var batches, rows int64
-	err := audit.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(cardinality(row_ids)),0) FROM platform_migrations.batch_checkpoints WHERE attempt_id=$1`, id).Scan(&batches, &rows)
+	batches, rows, err := committedProgress(ctx, audit, id)
 	if err != nil {
 		return err
 	}
 	c.job.CommittedBatches, c.job.CommittedRows = batches, rows
 	return w.progress(ctx, *c, batches, rows)
+}
+
+// The executor reads the application table using one statement snapshot. Only
+// the audit account writes scope pages. Publishing the ready flag in the same
+// transaction also distinguishes a frozen empty scope from an interrupted capture.
+func freezeBatchScope(ctx context.Context, executor, audit *sql.Conn, table string, attempt int64, size int) error {
+	tx, err := audit.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var ready, hasCheckpoints bool
+	err = tx.QueryRowContext(ctx, `SELECT batch_scope_ready, EXISTS(
+		SELECT 1 FROM platform_migrations.batch_checkpoints WHERE attempt_id=$1)
+		FROM platform_migrations.attempts WHERE id=$1 AND status='RUNNING' FOR UPDATE`, attempt).Scan(&ready, &hasCheckpoints)
+	if err != nil || ready {
+		return err
+	}
+	if hasCheckpoints {
+		return errors.New("cakupan asli attempt lama tidak tersedia")
+	}
+	ids, err := executor.QueryContext(ctx, "SELECT id FROM ONLY "+table+" ORDER BY id")
+	if err != nil {
+		return err
+	}
+	defer ids.Close()
+	page := make(pq.Int64Array, 0, size)
+	batchNo := int64(1)
+	save := func() error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO platform_migrations.batch_scope(attempt_id,batch_no,row_ids)
+			VALUES ($1,$2,$3)`, attempt, batchNo, page)
+		batchNo++
+		page = page[:0]
+		return err
+	}
+	for ids.Next() {
+		var key int64
+		if err := ids.Scan(&key); err != nil {
+			return err
+		}
+		page = append(page, key)
+		if len(page) == size {
+			if err := save(); err != nil {
+				return err
+			}
+		}
+	}
+	if err := ids.Err(); err != nil {
+		return err
+	}
+	if len(page) > 0 {
+		if err := save(); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE platform_migrations.attempts SET batch_scope_ready=TRUE WHERE id=$1`, attempt); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (w *Worker) progress(ctx context.Context, c claim, batches, rows int64) error {
@@ -49,16 +113,13 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 		return err
 	}
 	defer conn.Close()
-	// Freeze exact membership in PostgreSQL. Only one page of IDs enters Go memory.
-	if _, err = conn.ExecContext(ctx, "CREATE TEMP TABLE migration_scope ON COMMIT PRESERVE ROWS AS SELECT id FROM ONLY "+table); err != nil {
+	if err = freezeBatchScope(ctx, conn, audit, table, id, c.job.Submission.BatchSize); err != nil {
 		return err
 	}
-	defer conn.ExecContext(ctx, "DROP TABLE IF EXISTS pg_temp.migration_scope")
-	if _, err = conn.ExecContext(ctx, "CREATE UNIQUE INDEX ON pg_temp.migration_scope(id)"); err != nil {
+	batches, rows, err := committedProgress(ctx, audit, id)
+	if err != nil {
 		return err
 	}
-	var batches, rows int64
-	var cursor any
 	defer func() {
 		if outErr != nil && batches > 0 && !errors.Is(outErr, ErrOutcomeUnknown) {
 			outErr = errors.Join(errPartial, outErr)
@@ -68,17 +129,18 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 		if err = w.heartbeat(ctx, c); err != nil {
 			return err
 		}
+		var keys pq.Int64Array
+		err := audit.QueryRowContext(ctx, `SELECT row_ids FROM platform_migrations.batch_scope
+			WHERE attempt_id=$1 AND batch_no=$2`, id, batches+1).Scan(&keys)
+		last := errors.Is(err, sql.ErrNoRows)
+		if err != nil && !last {
+			return err
+		}
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
-		keys := pq.Int64Array{}
-		err = tx.QueryRowContext(ctx, `SELECT ARRAY(SELECT id FROM pg_temp.migration_scope WHERE ($1::bigint IS NULL OR id>$1) ORDER BY id LIMIT $2)`, cursor, c.job.Submission.BatchSize).Scan(&keys)
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-		if len(keys) == 0 {
+		if last {
 			_, err = tx.ExecContext(ctx, "SELECT platform_migrations.complete_attempt($1)", token)
 			if err != nil {
 				tx.Rollback()
@@ -108,7 +170,6 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 		}
 		batches++
 		rows += affected
-		cursor = keys[len(keys)-1]
 		if err = w.progress(ctx, c, batches, rows); err != nil {
 			return ErrOutcomeUnknown
 		}
