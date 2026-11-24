@@ -7,6 +7,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -237,14 +238,25 @@ func WrapTargetError(operation string, err error) error {
 		failure.Category, failure.safeCause = "canceled", context.Canceled
 	case errors.Is(err, context.DeadlineExceeded):
 		failure.Category, failure.safeCause = "timeout", context.DeadlineExceeded
+	case errors.Is(err, driver.ErrBadConn), errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, sql.ErrConnDone):
+		failure.Category, failure.safeCause = "network", ErrTargetConnectionNetwork
 	default:
 		var postgresError *pq.Error
 		var networkError net.Error
+		var my *mysql.MySQLError
 		if errors.As(err, &postgresError) && validTargetSQLState(string(postgresError.Code)) {
 			failure.SQLState = string(postgresError.Code)
 			failure.Category = "postgresql"
 			if strings.HasPrefix(failure.SQLState, "28") {
 				failure.Category, failure.safeCause = "authentication", ErrTargetConnectionAuth
+			}
+		} else if errors.As(err, &my) {
+			failure.Category = "mysql"
+			switch my.Number {
+			case 1045:
+				failure.Category, failure.safeCause = "authentication", ErrTargetConnectionAuth
+			case 1040, 1053, 2006, 2013:
+				failure.SQLState = "08006"
 			}
 		} else if errors.As(err, &networkError) {
 			failure.Category, failure.safeCause = "network", ErrTargetConnectionNetwork

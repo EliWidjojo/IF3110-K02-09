@@ -44,31 +44,34 @@ func SetupMySQLHistory(ctx context.Context, db *sql.DB, target, executor string)
 func verifyMySQLHistory(ctx context.Context, target, audit *sql.DB, cfg database.DatabaseConnection) error {
 	schema := HistorySchema(cfg.Driver, cfg.DatabaseName)
 	var executor, owner string
-	if target.QueryRowContext(ctx, `SELECT CURRENT_USER()`).Scan(&executor) != nil || audit.QueryRowContext(ctx, `SELECT CURRENT_USER()`).Scan(&owner) != nil || owner == executor {
-		return ErrUnsafeTarget
+	if err := target.QueryRowContext(ctx, `SELECT CURRENT_USER()`).Scan(&executor); err != nil {
+		return historyCheckError(err)
+	}
+	if err := audit.QueryRowContext(ctx, `SELECT CURRENT_USER()`).Scan(&owner); err != nil || owner == executor {
+		return historyCheckError(err)
 	}
 	for _, db := range []*sql.DB{target, audit} {
 		var count int
 		q := `SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES WHERE GRANTEE=CONCAT(QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',1)),'@',QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',-1))) AND PRIVILEGE_TYPE<>'USAGE'`
-		if db.QueryRowContext(ctx, q).Scan(&count) != nil || count != 0 {
-			return ErrUnsafeTarget
+		if err := db.QueryRowContext(ctx, q).Scan(&count); err != nil || count != 0 {
+			return historyCheckError(err)
 		}
 		// Role tambahan ditolak agar privilege tidak tersembunyi di balik role yang dapat diaktifkan ulang.
-		if db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.APPLICABLE_ROLES`).Scan(&count) != nil || count != 0 {
-			return ErrUnsafeTarget
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.APPLICABLE_ROLES`).Scan(&count); err != nil || count != 0 {
+			return historyCheckError(err)
 		}
 	}
 	var count int
 	q := `SELECT (SELECT COUNT(*) FROM information_schema.SCHEMA_PRIVILEGES WHERE TABLE_SCHEMA=? AND PRIVILEGE_TYPE<>'USAGE')+(SELECT COUNT(*) FROM information_schema.TABLE_PRIVILEGES WHERE TABLE_SCHEMA=? AND TABLE_NAME='attempts')`
-	if target.QueryRowContext(ctx, q, schema, schema).Scan(&count) != nil || count != 0 {
-		return ErrUnsafeTarget
+	if err := target.QueryRowContext(ctx, q, schema, schema).Scan(&count); err != nil || count != 0 {
+		return historyCheckError(err)
 	}
 	var definer string
-	if audit.QueryRowContext(ctx, `SELECT DEFINER FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=? AND ROUTINE_NAME='complete_attempt' AND SECURITY_TYPE='DEFINER'`, schema).Scan(&definer) != nil || definer != owner {
-		return ErrUnsafeTarget
+	if err := audit.QueryRowContext(ctx, `SELECT DEFINER FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=? AND ROUTINE_NAME='complete_attempt' AND SECURITY_TYPE='DEFINER'`, schema).Scan(&definer); err != nil || definer != owner {
+		return historyCheckError(err)
 	}
-	if audit.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME='attempts' AND ENGINE='InnoDB'`, schema).Scan(&count) != nil || count != 1 {
-		return ErrUnsafeTarget
+	if err := audit.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME='attempts' AND ENGINE='InnoDB'`, schema).Scan(&count); err != nil || count != 1 {
+		return historyCheckError(err)
 	}
 	return nil
 }

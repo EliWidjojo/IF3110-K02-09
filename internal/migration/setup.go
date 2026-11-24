@@ -127,7 +127,7 @@ func verifyPostgresHistory(ctx context.Context, target, audit *sql.DB) error {
  JOIN pg_class c ON c.relnamespace=n.oid AND c.relname='attempts'
  JOIN pg_proc p ON p.pronamespace=n.oid AND p.oid='platform_migrations.complete_attempt(text)'::regprocedure WHERE r.rolname=current_user`).Scan(&owner, &safe)
 	if err != nil || !safe {
-		return ErrUnsafeTarget
+		return historyCheckError(err)
 	}
 	err = target.QueryRowContext(ctx, `SELECT NOT (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)
  AND current_user<>$1 AND NOT pg_has_role(current_user,$1,'MEMBER')
@@ -140,7 +140,7 @@ func verifyPostgresHistory(ctx context.Context, target, audit *sql.DB) error {
  AND NOT EXISTS(SELECT 1 FROM pg_database WHERE datname=current_database() AND datdba=r.oid)
  FROM pg_roles r WHERE rolname=current_user`, owner).Scan(&safe)
 	if err != nil || !safe {
-		return ErrUnsafeTarget
+		return historyCheckError(err)
 	}
 	return nil
 }

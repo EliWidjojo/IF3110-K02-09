@@ -132,6 +132,10 @@ ALTER TABLE platform.migration_jobs
  ADD COLUMN IF NOT EXISTS committed_rows BIGINT NOT NULL DEFAULT 0,
  ADD COLUMN IF NOT EXISTS retry_count BIGINT NOT NULL DEFAULT 0,
  ADD COLUMN IF NOT EXISTS retry_pending BOOLEAN NOT NULL DEFAULT FALSE,
+ ADD COLUMN IF NOT EXISTS registration_hash TEXT NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS recovery_count INT NOT NULL DEFAULT 0,
+ ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ,
+ ADD COLUMN IF NOT EXISTS inspect_only BOOLEAN NOT NULL DEFAULT FALSE,
  ADD COLUMN IF NOT EXISTS cancel_origin TEXT NOT NULL DEFAULT '',
  ADD COLUMN IF NOT EXISTS cancel_waiting BOOLEAN NOT NULL DEFAULT FALSE,
  ADD COLUMN IF NOT EXISTS reverted_batches BIGINT NOT NULL DEFAULT 0,
@@ -142,7 +146,9 @@ ALTER TABLE platform.migration_jobs
  ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
 ALTER TABLE platform.migration_jobs DROP CONSTRAINT IF EXISTS migration_jobs_status_check;
 ALTER TABLE platform.migration_jobs ADD CONSTRAINT migration_jobs_status_check
- CHECK (status IN ('QUEUED','RUNNING','READY','PARTIAL','SUCCESS','FAILED','NEEDS_REVIEW','PARTIALLY_REVERTED','REVERTED'));
+ CHECK (status IN ('QUEUED','RUNNING','READY','RECOVERING','BLOCKED','PARTIAL','SUCCESS','FAILED','NEEDS_REVIEW','PARTIALLY_REVERTED','REVERTED'));
+CREATE INDEX IF NOT EXISTS migration_jobs_unresolved_target ON platform.migration_jobs(database_id,target_version)
+ WHERE attempt_id IS NOT NULL AND status IN ('NEEDS_REVIEW','PARTIAL','PARTIALLY_REVERTED','RECOVERING','RUNNING','QUEUED');
 -- Existing jobs intentionally retain NULL: their original destination cannot be reconstructed.
 CREATE OR REPLACE FUNCTION platform.capture_job_target() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN

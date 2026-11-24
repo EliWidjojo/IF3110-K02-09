@@ -212,9 +212,7 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 			if err == nil {
 				break
 			}
-			var pgErr *pq.Error
-			if retries >= 3 || !errors.As(err, &pgErr) ||
-				(pgErr.Code != "40001" && pgErr.Code != "40P01" && pgErr.Code != "55P03") {
+			if retries >= 3 || !transientTransaction(err) {
 				return err
 			}
 			select {

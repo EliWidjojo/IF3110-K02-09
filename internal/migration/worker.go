@@ -42,13 +42,17 @@ func (w *Worker) claim(ctx context.Context) (claim, error) {
 	token := hex.EncodeToString(secret[:])
 	j, err := scanJob(w.db.QueryRowContext(ctx, `WITH candidate AS (
 	 SELECT j.id FROM platform.migration_jobs j JOIN platform.job_admission a ON a.id=j.id
-	 WHERE (j.status IN ('QUEUED','READY') AND (a.approved OR j.cancel_waiting)) OR
+	 WHERE ((j.next_attempt_at IS NULL OR j.next_attempt_at<=clock_timestamp()) AND
+	       (j.status IN ('RECOVERING','BLOCKED') OR (j.status IN ('QUEUED','READY') AND (a.approved OR j.cancel_waiting)))
+	       AND NOT EXISTS (SELECT 1 FROM platform.migration_jobs busy WHERE busy.database_id=j.database_id
+	         AND busy.id<>j.id AND busy.status='RUNNING' AND busy.lease_until>clock_timestamp())) OR
 	       (j.status='RUNNING' AND j.lease_token IS NOT NULL AND j.lease_until <= clock_timestamp())
-	 ORDER BY j.updated_at,j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1
+	 ORDER BY CASE WHEN j.status IN ('RUNNING','RECOVERING') THEN 0 ELSE 1 END,j.updated_at,j.id
+	 FOR UPDATE OF j SKIP LOCKED LIMIT 1
 	)
 	UPDATE platform.migration_jobs SET worker_id=$1,lease_token=$2,status='RUNNING',
 	 heartbeat_at=clock_timestamp(),lease_until=clock_timestamp()+interval '30 seconds',
-	 started_at=COALESCE(started_at,clock_timestamp()),error_code=''
+	 started_at=COALESCE(started_at,clock_timestamp()),next_attempt_at=NULL,error_code=''
 	 WHERE id=(SELECT id FROM candidate) RETURNING `+jobColumns, w.name, token))
 	return claim{j, token}, err
 }
@@ -133,6 +137,8 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		 status=CASE WHEN cancel_waiting AND $3 IN ('PARTIAL','SUCCESS') THEN 'QUEUED' ELSE $3 END,
 		 cancel_origin=CASE WHEN cancel_waiting AND $3 IN ('PARTIAL','SUCCESS') THEN $3 ELSE cancel_origin END,
 		 cancel_waiting=(cancel_waiting AND $3='QUEUED'),
+		 next_attempt_at=CASE WHEN $3='BLOCKED' THEN clock_timestamp()+interval '5 seconds' END,
+		 inspect_only=false,
 		 error_code=CASE WHEN cancel_waiting AND $3 IN ('PARTIAL','SUCCESS') THEN '' ELSE $4 END,
 		 retry_pending=(retry_pending AND $3='QUEUED'),
 		 lease_token=NULL,lease_until=NULL,finished_at=CASE WHEN cancel_waiting AND $3 IN ('PARTIAL','SUCCESS') THEN NULL
@@ -143,6 +149,28 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		}
 		return tx.Commit()
 	}
+	// Queue the next attempt on the database clock. Counting and releasing the
+	// lease in one update keeps the retry budget intact across restarts.
+	scheduleRecovery := func(code string, restart bool) error {
+		if c.job.RecoveryCount >= 3 {
+			if restart {
+				return finish(JobFailed, code)
+			}
+			if c.job.AttemptID != nil || c.job.inspectOnly {
+				return finish(JobNeedsReview, code)
+			}
+			return finish(JobFailed, code)
+		}
+		res, e := tx.ExecContext(ctx, `UPDATE platform.migration_jobs SET status='RECOVERING',error_code=$3,
+			recovery_count=recovery_count+1,next_attempt_at=clock_timestamp()+$4 * interval '1 second',inspect_only=$5,
+			attempt_id=CASE WHEN $6 THEN NULL ELSE attempt_id END,
+			lease_token=NULL,lease_until=NULL,finished_at=NULL WHERE `+ownsLease, c.job.ID, c.token, code, 1<<c.job.RecoveryCount, c.job.inspectOnly, restart)
+		if e = checkOwner(res, e); e != nil {
+			return e
+		}
+		return tx.Commit()
+	}
+	recoverLater := func(code string) error { return scheduleRecovery(code, false) }
 	admission := func() (string, error) {
 		var code string
 		err := tx.QueryRowContext(ctx, `SELECT CASE WHEN same_target IS NOT TRUE THEN 'target_changed'
@@ -158,7 +186,10 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	}
 	if code, err := admission(); err != nil {
 		return err
-	} else if code != "" && (c.job.AttemptID == nil || c.job.retryPending || (c.job.CancelOrigin != "" && !c.job.CancelWaiting) || code == "target_changed") {
+	} else if code != "" && (code == "target_changed" || (!c.job.inspectOnly && (c.job.AttemptID == nil || c.job.retryPending || (c.job.CancelOrigin != "" && !c.job.CancelWaiting)))) {
+		if code == "target_changed" && c.job.AttemptID != nil {
+			return finish(JobNeedsReview, code)
+		}
 		return check(code)
 	}
 	if err = ValidateSubmission(ctx, c.job.Submission, c.job.Driver, "preflight"); err != nil {
@@ -173,23 +204,44 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	defer pools.Close()
 	target, err := pools.Get(ctx, c.job.DatabaseID)
 	if err != nil {
+		if temporaryTargetError(err) {
+			return recoverLater("target_unavailable")
+		}
+		if c.job.AttemptID != nil {
+			return finish(JobNeedsReview, "target_unavailable")
+		}
 		return finish(JobFailed, "target_unavailable")
 	}
 	audit, cfg, err := pools.OpenAudit(ctx, c.job.DatabaseID)
 	if err != nil {
+		if temporaryTargetError(err) {
+			return recoverLater("audit_unavailable")
+		}
+		if c.job.AttemptID != nil {
+			return finish(JobNeedsReview, "audit_unavailable")
+		}
 		return finish(JobFailed, "audit_unavailable")
 	}
 	defer audit.Close()
 	control, err := audit.Conn(ctx)
 	if err != nil {
-		return finish(JobFailed, "audit_unavailable")
+		return recoverLater("audit_unavailable")
 	}
 	defer control.Close()
 	lockCtx, cancelLock := context.WithTimeout(ctx, 12*time.Second)
 	err = lockHistory(lockCtx, control, cfg)
 	cancelLock()
 	if err != nil {
-		return finish(JobQueued, "target_busy")
+		if errors.Is(err, errTargetBusy) {
+			// Waiting for another migration does not consume the failure budget.
+			res, e := tx.ExecContext(ctx, `UPDATE platform.migration_jobs SET status='RECOVERING',error_code='target_busy',
+				next_attempt_at=clock_timestamp()+interval '2 seconds',lease_token=NULL,lease_until=NULL WHERE `+ownsLease, c.job.ID, c.token)
+			if e = checkOwner(res, e); e != nil {
+				return e
+			}
+			return tx.Commit()
+		}
+		return recoverLater("lock_unavailable")
 	}
 	defer unlockHistory(control, cfg)
 	if cfg.Driver.IsMySQL() {
@@ -198,9 +250,29 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		err = verifyPostgresHistory(ctx, target, audit)
 	}
 	if err != nil {
+		if temporaryTargetError(err) {
+			return recoverLater("history_unavailable")
+		}
+		if c.job.AttemptID != nil {
+			return finish(JobNeedsReview, "unsafe_target")
+		}
 		return finish(JobFailed, "unsafe_target")
 	}
 	schema := cfg.Driver.Quote(HistorySchema(cfg.Driver, cfg.DatabaseName))
+	if c.job.registrationHash != "" {
+		err = w.retireRegistration(ctx, c, control, cfg)
+		if errors.Is(err, errAttemptMismatch) {
+			return finish(JobNeedsReview, "attempt_mismatch")
+		}
+		if err != nil {
+			return recoverLater("registration_unavailable")
+		}
+		c.job.AttemptID = nil
+		c.job.registrationHash = ""
+		if c.job.inspectOnly {
+			return finish(JobFailed, "interrupted_before_execution")
+		}
+	}
 	reconcile := func(batchError string) error {
 		var state string
 		var frozen bool
@@ -209,16 +281,28 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 			// completion functions lock, then read the committed target evidence.
 			if _, err := control.ExecContext(ctx, `UPDATE platform_migrations.attempts SET capability_hash=NULL
 				WHERE id=$1 AND status='RUNNING'`, *c.job.AttemptID); err != nil {
-				return finish(JobNeedsReview, "outcome_unknown")
+				return recoverLater("outcome_unknown")
 			}
 			if err := control.QueryRowContext(ctx, `SELECT status,batch_scope_ready FROM platform_migrations.attempts
 				WHERE id=$1`, *c.job.AttemptID).Scan(&state, &frozen); err != nil {
-				return finish(JobNeedsReview, "outcome_unknown")
+				return recoverLater("outcome_unknown")
+			}
+			if frozen {
+				ok, err := validBatchEvidence(ctx, control, *c.job.AttemptID, state == "SUCCESS")
+				if err != nil {
+					return recoverLater("checkpoint_unavailable")
+				}
+				if !ok {
+					return finish(JobNeedsReview, "unsafe_checkpoint")
+				}
 			}
 			if err = w.syncProgress(ctx, &c, control, *c.job.AttemptID); err != nil {
-				return finish(JobNeedsReview, "checkpoint_unavailable")
+				return recoverLater("checkpoint_unavailable")
 			}
-			if frozen && state == "RUNNING" {
+			if (state == "FAILED" || state == "INTERRUPTED") && c.job.CommittedBatches > 0 {
+				return finish(JobNeedsReview, "checkpoint_status_mismatch")
+			}
+			if state == "RUNNING" && (frozen || c.job.CommittedBatches == 0) {
 				targetState, targetCode := "FAILED", "batch_failed"
 				if c.job.CommittedBatches > 0 {
 					targetState, targetCode = "NEEDS_REVIEW", "partial_batch"
@@ -226,19 +310,35 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 				if _, err := control.ExecContext(ctx, `UPDATE platform_migrations.attempts
 					SET status=$2,error_code=$3,finished_at=clock_timestamp() WHERE id=$1 AND status='RUNNING'`,
 					*c.job.AttemptID, targetState, targetCode); err != nil {
-					return finish(JobNeedsReview, "outcome_unknown")
+					return recoverLater("outcome_unknown")
 				}
 				if c.job.CommittedBatches == 0 {
 					return finish(JobFailed, batchError)
 				}
 			}
-		} else if err := control.QueryRowContext(ctx, "SELECT status FROM "+schema+".attempts WHERE id="+cfg.Driver.Bind(1), *c.job.AttemptID).Scan(&state); err != nil {
-			return finish(JobNeedsReview, "outcome_unknown")
+		} else {
+			// The completion marker participates in the data transaction. This
+			// update waits out its commit and fences any later completion.
+			endState := "FAILED"
+			if c.job.Submission.NonAtomicDDL {
+				endState = "NEEDS_REVIEW"
+			}
+			q := "UPDATE " + schema + ".attempts SET status=" + cfg.Driver.Bind(1) + ",error_code='interrupted',finished_at=CURRENT_TIMESTAMP,capability_hash=NULL WHERE id=" + cfg.Driver.Bind(2) + " AND status='RUNNING'"
+			if _, err := control.ExecContext(ctx, q, endState, *c.job.AttemptID); err != nil {
+				return recoverLater("outcome_unknown")
+			}
+			var reason string
+			if err := control.QueryRowContext(ctx, "SELECT status,error_code FROM "+schema+".attempts WHERE id="+cfg.Driver.Bind(1), *c.job.AttemptID).Scan(&state, &reason); err != nil {
+				return recoverLater("outcome_unknown")
+			}
+			if state == "FAILED" && reason == "interrupted" && !c.job.Submission.NonAtomicDDL && !c.job.inspectOnly {
+				return scheduleRecovery("interrupted_rollback", true)
+			}
 		}
 		switch state {
 		case "SUCCESS":
 			return finish(JobSuccess, "")
-		case "FAILED":
+		case "FAILED", "INTERRUPTED":
 			return finish(JobFailed, "sql_failed")
 		}
 		if c.job.Submission.BatchSize > 0 && c.job.CommittedBatches > 0 {
@@ -247,19 +347,38 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		return finish(JobNeedsReview, "outcome_unknown")
 	}
 	if c.job.AttemptID != nil {
+		if err := verifyAttempt(ctx, control, cfg, c.job); errors.Is(err, errAttemptMismatch) {
+			return finish(JobNeedsReview, "attempt_mismatch")
+		} else if err != nil {
+			return recoverLater("history_unavailable")
+		}
 		if c.job.CancelWaiting {
 			return reconcile("interrupted")
 		}
 		if c.job.CancelOrigin != "" {
-			if code, err := admission(); err != nil {
-				return err
-			} else if code != "" {
-				return check(code)
-			}
 			if c.job.Submission.BatchSize == 0 || c.job.Submission.DownSQL == "" {
 				return finish(JobNeedsReview, "unsafe_revert")
 			}
-			return finish(w.cancelBatch(ctx, c, target, control))
+			var status JobStatus
+			var code string
+			if c.job.inspectOnly {
+				status, code = w.settleRevert(ctx, c, control, ErrOutcomeUnknown)
+			} else {
+				if denied, err := admission(); err != nil {
+					return err
+				} else if denied != "" {
+					return check(denied)
+				}
+				status, code = w.cancelBatch(ctx, c, target, control)
+			}
+			if status == JobNeedsReview && (code == "revert_checkpoint_unavailable" || code == "revert_outcome_unknown") {
+				c.job.inspectOnly = true
+				return recoverLater(code)
+			}
+			return finish(status, code)
+		}
+		if c.job.inspectOnly {
+			return reconcile("interrupted")
 		}
 		if c.job.retryPending {
 			if code, err := admission(); err != nil {
@@ -278,7 +397,7 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 				return finish(JobNeedsReview, "unsafe_checkpoint")
 			}
 			if err != nil {
-				return finish(JobNeedsReview, "checkpoint_unavailable")
+				return recoverLater("checkpoint_unavailable")
 			}
 			if token != "" {
 				if err := w.runBatch(ctx, c, target, control, token, *c.job.AttemptID); err != nil && !errors.Is(err, ErrOutcomeUnknown) {
@@ -289,12 +408,29 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		}
 		return reconcile("interrupted")
 	}
+	if c.job.inspectOnly {
+		return finish(JobNeedsReview, "attempt_missing")
+	}
+	// Target history protects aliases of the same physical database. Also
+	// hold new work while this registration still has unresolved evidence
+	// on the platform, even when the target has already completed its commit.
+	var held bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM platform.migration_jobs
+		WHERE database_id=$1 AND target_version=$2 AND id<>$3 AND attempt_id IS NOT NULL AND
+		(status IN ('NEEDS_REVIEW','PARTIAL','PARTIALLY_REVERTED','RECOVERING','RUNNING') OR
+		(status='QUEUED' AND (retry_pending OR cancel_origin<>''))))`, c.job.DatabaseID, version, c.job.ID).Scan(&held)
+	if err != nil {
+		return err
+	}
+	if held {
+		return finish(JobBlocked, "history_requires_review")
+	}
 	var latest, unresolved int
 	if err = control.QueryRowContext(ctx, "SELECT COALESCE(MAX(CASE WHEN status='SUCCESS' THEN version END),0),COUNT(CASE WHEN status IN ('RUNNING','NEEDS_REVIEW') THEN 1 END) FROM "+schema+".attempts").Scan(&latest, &unresolved); err != nil {
-		return finish(JobFailed, "history_unavailable")
+		return recoverLater("history_unavailable")
 	}
 	if unresolved > 0 {
-		return finish(JobFailed, "history_requires_review")
+		return finish(JobBlocked, "history_requires_review")
 	}
 	if c.job.Submission.Version <= latest {
 		return finish(JobFailed, "version_conflict")
@@ -305,7 +441,7 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	}
 	var legacy int
 	if err = target.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema="+cfg.Driver.Bind(1)+" AND table_name='schema_migrations'", legacySchema).Scan(&legacy); err != nil {
-		return finish(JobFailed, "history_unavailable")
+		return recoverLater("history_unavailable")
 	}
 	if legacy > 0 {
 		var imported int
@@ -337,12 +473,13 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	if err = w.heartbeat(ctx, c); err != nil {
 		return err
 	}
-	start := func(id int64) error {
-		res, err := w.db.ExecContext(ctx, `UPDATE platform.migration_jobs SET attempt_id=$3 WHERE `+ownsLease, c.job.ID, c.token, id)
+	start := func(id int64, hash string) error {
+		res, err := w.db.ExecContext(ctx, `UPDATE platform.migration_jobs SET attempt_id=$3,registration_hash=$4 WHERE `+ownsLease, c.job.ID, c.token, id, hash)
 		if err = checkOwner(res, err); err != nil {
-			return err
+			return errors.Join(errRegistration, err)
 		}
 		c.job.AttemptID = &id
+		c.job.registrationHash = hash
 		return nil
 	}
 	var batch func(string, int64) error
@@ -351,6 +488,12 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	}
 	result, err := executeLocked(ctx, target, control, cfg, c.job.SubmittedBy, req, statements, latest, start, batch)
 	switch {
+	case errors.Is(err, errRegistration):
+		return err
+	case errors.Is(err, errTransientRollback) && result.Status == "FAILED":
+		return scheduleRecovery("transient_rollback", true)
+	case c.job.registrationHash != "":
+		return recoverLater("registration_unavailable")
 	case err == nil:
 		return finish(JobSuccess, "")
 	case errors.Is(err, errPartial):

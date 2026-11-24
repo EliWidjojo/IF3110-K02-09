@@ -209,24 +209,55 @@ func (w *Worker) cancelBatch(ctx context.Context, c claim, target *sql.DB, audit
 			break
 		}
 	}
+	return w.settleRevert(ctx, c, audit, err)
+}
+
+func (w *Worker) settleRevert(ctx context.Context, c claim, audit *sql.Conn, err error) (JobStatus, string) {
+	j := c.job
 	// Wait for any uncertain commit, revoke this capability, then derive the
 	// result from durable checkpoints before allowing another approval round.
 	if _, e := audit.ExecContext(ctx, `UPDATE platform_migrations.attempts SET capability_hash=NULL
 		WHERE id=$1 AND error_code='reverting_batch'`, *j.AttemptID); e != nil {
 		return JobNeedsReview, "revert_outcome_unknown"
 	}
+	// A crash can lose either set of platform counters. Check both the forward
+	// prefix and the reverse suffix before rebuilding them from the target.
+	valid, e := validBatchEvidence(ctx, audit, *j.AttemptID, j.CancelOrigin == JobSuccess)
+	if e != nil {
+		return JobNeedsReview, "revert_checkpoint_unavailable"
+	}
+	if !valid {
+		return JobNeedsReview, "revert_checkpoint_mismatch"
+	}
+	if e = audit.QueryRowContext(ctx, `SELECT count(*)>0 AND count(recovery)=count(*) AND
+		count(*) FILTER(WHERE reverted_at IS NULL)=coalesce(max(batch_no) FILTER(WHERE reverted_at IS NULL),0)
+		FROM platform_migrations.batch_checkpoints WHERE attempt_id=$1`, *j.AttemptID).Scan(&valid); e != nil {
+		return JobNeedsReview, "revert_checkpoint_unavailable"
+	}
+	if !valid {
+		return JobNeedsReview, "revert_checkpoint_mismatch"
+	}
+	if e = w.syncProgress(ctx, &c, audit, *j.AttemptID); e != nil {
+		return JobNeedsReview, "revert_checkpoint_unavailable"
+	}
 	if e := w.syncReverted(ctx, &c, audit); e != nil {
 		return JobNeedsReview, "revert_checkpoint_unavailable"
 	}
-	var state string
-	if e := audit.QueryRowContext(ctx, "SELECT status FROM platform_migrations.attempts WHERE id=$1", *j.AttemptID).Scan(&state); e != nil {
+	var state, reason string
+	if e := audit.QueryRowContext(ctx, "SELECT status,error_code FROM platform_migrations.attempts WHERE id=$1", *j.AttemptID).Scan(&state, &reason); e != nil {
 		return JobNeedsReview, "revert_outcome_unknown"
 	}
 	if state == "REVERTED" {
-		if c.job.RevertedBatches != j.CommittedBatches || c.job.RevertedRows != j.CommittedRows {
+		if c.job.RevertedBatches != c.job.CommittedBatches || c.job.RevertedRows != c.job.CommittedRows {
 			return JobNeedsReview, "revert_checkpoint_mismatch"
 		}
 		return JobReverted, ""
+	}
+	if !(state == "NEEDS_REVIEW" && reason == "reverting_batch") {
+		if c.job.RevertedBatches == 0 && ((state == "SUCCESS" && j.CancelOrigin == JobSuccess) || (reason == "partial_batch" && state == "NEEDS_REVIEW" && j.CancelOrigin == JobPartial)) {
+			return j.CancelOrigin, "revert_interrupted"
+		}
+		return JobNeedsReview, "revert_checkpoint_mismatch"
 	}
 	code := "revert_failed"
 	var pgErr *pq.Error
@@ -236,11 +267,11 @@ func (w *Worker) cancelBatch(ctx context.Context, c claim, target *sql.DB, audit
 	if c.job.RevertedBatches > 0 {
 		return JobPartiallyReverted, code
 	}
-	state, reason := "SUCCESS", ""
+	state, reason = "SUCCESS", ""
 	if j.CancelOrigin == JobPartial {
 		state, reason = "NEEDS_REVIEW", "partial_batch"
 	}
-	_, e := audit.ExecContext(ctx, `UPDATE platform_migrations.attempts SET status=$2,error_code=$3
+	_, e = audit.ExecContext(ctx, `UPDATE platform_migrations.attempts SET status=$2,error_code=$3
 		WHERE id=$1 AND error_code='reverting_batch'`, *j.AttemptID, state, reason)
 	if e != nil {
 		return JobNeedsReview, "revert_outcome_unknown"

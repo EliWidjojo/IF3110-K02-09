@@ -25,6 +25,8 @@ const (
 	JobRunning           JobStatus = "RUNNING"
 	JobPartial           JobStatus = "PARTIAL"
 	JobReady             JobStatus = "READY"
+	JobRecovering        JobStatus = "RECOVERING"
+	JobBlocked           JobStatus = "BLOCKED"
 	JobSuccess           JobStatus = "SUCCESS"
 	JobFailed            JobStatus = "FAILED"
 	JobNeedsReview       JobStatus = "NEEDS_REVIEW"
@@ -53,6 +55,10 @@ type JobSubmission struct {
 }
 
 type Job struct {
+	RecoveryCount    int        `json:"recovery_count"`
+	NextAttemptAt    *time.Time `json:"next_attempt_at,omitempty"`
+	registrationHash string
+	inspectOnly      bool
 	CancelOrigin     JobStatus `json:"cancel_origin,omitempty"`
 	CancelWaiting    bool      `json:"cancel_waiting,omitempty"`
 	RevertedBatches  int64     `json:"reverted_batches"`
@@ -176,13 +182,14 @@ func (s *JobService) SubmitJob(ctx context.Context, databaseID int, key string, 
 }
 
 const jobColumns = `id, database_id, submitted_by, version, query_sql, non_atomic_ddl,
-	driver, status, worker_id, created_at, updated_at, started_at, finished_at, error_code, heartbeat_at, lease_until, batch_size, down_sql, operation, source_job, attempt_id, committed_batches, committed_rows, retry_count, retry_pending, cancel_origin, reverted_batches, reverted_rows,cancel_waiting`
+	driver, status, worker_id, created_at, updated_at, started_at, finished_at, error_code, heartbeat_at, lease_until, batch_size, down_sql, operation, source_job, attempt_id, committed_batches, committed_rows, retry_count, retry_pending, cancel_origin, reverted_batches, reverted_rows,cancel_waiting,
+	recovery_count,next_attempt_at,registration_hash,inspect_only`
 
 func scanJob(row interface{ Scan(...any) error }) (Job, error) {
 	var j Job
 	err := row.Scan(&j.ID, &j.DatabaseID, &j.SubmittedBy, &j.Submission.Version,
 		&j.Submission.QuerySQL, &j.Submission.NonAtomicDDL, &j.Driver, &j.Status,
-		&j.WorkerID, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt, &j.ErrorCode, &j.HeartbeatAt, &j.LeaseUntil, &j.Submission.BatchSize, &j.Submission.DownSQL, &j.Submission.Operation, &j.Submission.SourceJob, &j.AttemptID, &j.CommittedBatches, &j.CommittedRows, &j.RetryCount, &j.retryPending, &j.CancelOrigin, &j.RevertedBatches, &j.RevertedRows, &j.CancelWaiting)
+		&j.WorkerID, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt, &j.ErrorCode, &j.HeartbeatAt, &j.LeaseUntil, &j.Submission.BatchSize, &j.Submission.DownSQL, &j.Submission.Operation, &j.Submission.SourceJob, &j.AttemptID, &j.CommittedBatches, &j.CommittedRows, &j.RetryCount, &j.retryPending, &j.CancelOrigin, &j.RevertedBatches, &j.RevertedRows, &j.CancelWaiting, &j.RecoveryCount, &j.NextAttemptAt, &j.registrationHash, &j.inspectOnly)
 	j.StatusURL = fmt.Sprintf("/api/databases/%d/migrations/jobs/%d", j.DatabaseID, j.ID)
 	return j, err
 }
@@ -293,7 +300,7 @@ func (s *JobService) queueBatchAction(ctx context.Context, databaseID int, jobID
 		return Job{}, err
 	}
 	j, err = scanJob(tx.QueryRowContext(ctx, `UPDATE platform.migration_jobs
-		SET retry_count=$2,retry_pending=$4,retry_requested_by=$3,cancel_origin=$5,cancel_waiting=$6,
+		SET retry_count=$2,retry_pending=$4,retry_requested_by=$3,cancel_origin=$5,cancel_waiting=$6,recovery_count=0,next_attempt_at=NULL,inspect_only=false,
 		    status=CASE WHEN $6 THEN status ELSE 'QUEUED' END,finished_at=NULL,
 		    worker_id=CASE WHEN $6 THEN worker_id END,heartbeat_at=CASE WHEN $6 THEN heartbeat_at END,error_code=''
 		WHERE id=$1 AND EXISTS (SELECT 1 FROM platform.job_admission WHERE id=$1 AND same_target)
@@ -321,12 +328,54 @@ func NewJobHandler(service *JobService, csrf admin.UserCSRFVerifier) *JobHandler
 }
 
 func RegisterJobRoutes(mux *http.ServeMux, h *JobHandler) {
+	mux.HandleFunc("POST /api/databases/{database_id}/migrations/jobs/{job_id}/recovery", h.handleRecovery)
 	mux.HandleFunc("PUT /api/databases/{database_id}/migrations/jobs/{job_id}/cancellations/{number}", func(w http.ResponseWriter, r *http.Request) { h.handleBatchAction(w, r, true) })
 	mux.HandleFunc("PUT /api/databases/{database_id}/migrations/jobs/{job_id}/retries/{number}", h.HandleRetryBatch)
 	mux.HandleFunc("PUT /api/databases/{database_id}/migrations/jobs/{job_id}/approvals/{group_id}", h.HandleApprove)
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/execute", h.HandleSubmitJob)
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/jobs", h.HandleSubmitJob)
 	mux.HandleFunc("GET /api/databases/{database_id}/migrations/jobs/{job_id}", h.HandleGetJob)
+}
+
+// Re-read authoritative history after an operator has restored connectivity
+// or resolved an ambiguous target attempt. The request cannot set its outcome.
+func (h *JobHandler) handleRecovery(w http.ResponseWriter, r *http.Request) {
+	if h.csrf == nil || h.csrf.ValidateCSRF(r) != nil {
+		admin.WriteUserServiceError(w, admin.ErrInvalidUserCSRF)
+		return
+	}
+	dbID, err := jobDatabaseID(r)
+	jobID, e := strconv.ParseInt(r.PathValue("job_id"), 10, 64)
+	if err != nil || e != nil || jobID <= 0 {
+		writeJobError(w, &InputError{"ID database atau job tidak valid"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err = h.service.access.RequireEdit(ctx, dbID); err != nil {
+		writeJobError(w, err)
+		return
+	}
+	j, err := scanJob(h.service.db.QueryRowContext(ctx, `UPDATE platform.migration_jobs SET status='RECOVERING',inspect_only=true,
+		recovery_count=0,next_attempt_at=clock_timestamp(),finished_at=NULL,error_code='checking_history'
+		WHERE database_id=$1 AND id=$2 AND status='NEEDS_REVIEW' AND attempt_id IS NOT NULL
+		AND EXISTS (SELECT 1 FROM platform.job_admission a WHERE a.id=$2 AND a.same_target)
+		RETURNING `+jobColumns, dbID, jobID))
+	if errors.Is(err, sql.ErrNoRows) {
+		j, err = h.service.GetJob(ctx, dbID, jobID)
+		if err == nil && !(j.inspectOnly && (j.Status == JobRunning || j.Status == JobRecovering)) {
+			httpapi.WriteJSON(w, 409, nil, &httpapi.Error{Code: "recovery_conflict", Message: "pemeriksaan memerlukan attempt pada target asli dengan status NEEDS_REVIEW"})
+			return
+		}
+	} else if err != nil {
+		err = ErrJobStorage
+	}
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	w.Header().Set("Location", j.StatusURL)
+	httpapi.WriteJSON(w, http.StatusAccepted, j, nil)
 }
 
 func (h *JobHandler) HandleRetryBatch(w http.ResponseWriter, r *http.Request) {

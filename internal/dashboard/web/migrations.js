@@ -24,7 +24,7 @@
  }
  let monitorGeneration=0,retry=null,reviewed=null;
  function operationFields(){
-  if(!reviewed)$("migration-cancel").hidden=true;
+  if(!reviewed){$("migration-cancel").hidden=true;$("migration-reconcile").hidden=true;}
   const apply=$("migration-operation").value==="apply",pg=selected()?.driver==="postgres";
   $("migration-source-label").hidden=apply;
   $("migration-source").required=!apply;
@@ -40,6 +40,7 @@
   $("migration-job-id").value=job.id;
   while(ticket===monitorGeneration && app.user){
    reviewed=job;
+   $("migration-reconcile").hidden=!(editable() && job.status==="NEEDS_REVIEW" && job.attempt_id && job.error_code!=="target_changed");
    const batch=editable() && job.submission.batch_size>0 && job.attempt_id;
    $("migration-retry").hidden=!(batch && ["PARTIAL","FAILED"].includes(job.status) && (!job.cancel_origin || (job.status==="PARTIAL" && !job.reverted_batches)));
    $("migration-cancel").hidden=!(batch && job.submission.down_sql && job.committed_batches>0 &&
@@ -51,7 +52,13 @@
    const restored=job.cancel_origin ? ` · Dipulihkan: ${job.reverted_batches} batch, ${job.reverted_rows} row` : "";
    const issue=job.error_code==="unsafe_revert"?"Pembatalan tidak aman. Ajukan migration perbaikan.":job.error_code||"";
    $("migration-job-status").textContent=`Job #${job.id}${round} · ${job.status} · ${job.committed_batches} batch, ${job.committed_rows} row committed${restored} ${issue}`;
-   if(!["QUEUED","RUNNING","READY"].includes(job.status)){await history(true);return;}
+   if(job.status==="BLOCKED")$("migration-job-status").textContent+=" · Menunggu penyelesaian migration lain pada database ini.";
+   if(job.status==="RECOVERING" && job.next_attempt_at){
+    const reason=job.error_code==="target_busy"?"Menunggu kunci database":job.recovery_count?`Pemulihan ke-${job.recovery_count}`:"Pemeriksaan riwayat";
+    $("migration-job-status").textContent+=` · ${reason} dijadwalkan pukul ${new Date(job.next_attempt_at).toLocaleTimeString("id-ID")}.`;
+   }
+   if(job.status==="NEEDS_REVIEW" && job.error_code==="outcome_unknown")$("migration-job-status").textContent+=" · Periksa hasil transaksi pada target sebelum melanjutkan migration.";
+   if(!["QUEUED","RUNNING","READY","RECOVERING","BLOCKED"].includes(job.status)){await history(true);return;}
    await new Promise(resolve=>setTimeout(resolve,1500));
    if(ticket!==monitorGeneration)return;
    job=await app.api(job.status_url);
@@ -80,8 +87,15 @@
  }
  async function diff(){if(!editable())throw new Error("Akses View + Edit diperlukan.");let input;try{input=JSON.parse($("diff-input").value);}catch{throw new Error("Schema tujuan harus berupa JSON valid.");}const request=scope();candidate="";permissions();const result=await app.api(`${base()}/diff`,{method:"POST",body:input,signal:request.signal});if(request.ticket!==generation)return;candidate=result.sql;$("diff-sql").textContent=candidate||"Tidak ada SQL tambahan yang dapat dihasilkan otomatis.";$("diff-limitations").textContent=result.limitations;app.table($("diff-changes"),[{label:"Objek",value:d=>d.object},{label:"Perbedaan",value:d=>d.kind},{label:"Keputusan",value:d=>`${d.requires_decision?"Perlu keputusan: ":""}${d.message}`}],result.differences,"Tidak ada perbedaan pada cakupan yang didukung.");permissions();}
  document.addEventListener("DOMContentLoaded",()=>{
+  $("migration-reconcile").addEventListener("click",()=>app.action(async()=>{
+   const job=reviewed;
+   if(!editable() || job?.status!=="NEEDS_REVIEW")return;
+   const ticket=++monitorGeneration;
+   const queued=await app.api(job.status_url+"/recovery",{method:"POST"});
+   await monitor(queued,ticket);
+  },$("migration-reconcile")));
   $("migration-monitor").addEventListener("click",()=>app.action(async()=>{
-   const ticket=++monitorGeneration;reviewed=null;$("migration-review").hidden=true;$("migration-retry").hidden=true;$("migration-cancel").hidden=true;
+   const ticket=++monitorGeneration;reviewed=null;$("migration-review").hidden=true;$("migration-retry").hidden=true;$("migration-cancel").hidden=true;$("migration-reconcile").hidden=true;
    const job=await app.api(base()+"/jobs/"+encodeURIComponent($("migration-job-id").value));
    await monitor(job,ticket);
   }));
