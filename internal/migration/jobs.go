@@ -24,6 +24,7 @@ type JobStatus string
 const (
 	JobQueued      JobStatus = "QUEUED"
 	JobRunning     JobStatus = "RUNNING"
+	JobReady       JobStatus = "READY"
 	JobSuccess     JobStatus = "SUCCESS"
 	JobFailed      JobStatus = "FAILED"
 	JobNeedsReview JobStatus = "NEEDS_REVIEW"
@@ -51,6 +52,8 @@ type Job struct {
 	Driver      database.Dialect `json:"driver"`
 	Status      JobStatus        `json:"status"`
 	WorkerID    *string          `json:"worker_id"`
+	HeartbeatAt *time.Time       `json:"heartbeat_at"`
+	LeaseUntil  *time.Time       `json:"lease_until"`
 	CreatedAt   time.Time        `json:"created_at"`
 	UpdatedAt   time.Time        `json:"updated_at"`
 	StartedAt   *time.Time       `json:"started_at"`
@@ -123,13 +126,13 @@ func (s *JobService) SubmitJob(ctx context.Context, databaseID int, key string, 
 }
 
 const jobColumns = `id, database_id, submitted_by, version, query_sql, non_atomic_ddl,
-	driver, status, worker_id, created_at, updated_at, started_at, finished_at, error_code`
+	driver, status, worker_id, created_at, updated_at, started_at, finished_at, error_code, heartbeat_at, lease_until`
 
 func scanJob(row interface{ Scan(...any) error }) (Job, error) {
 	var j Job
 	err := row.Scan(&j.ID, &j.DatabaseID, &j.SubmittedBy, &j.Submission.Version,
 		&j.Submission.QuerySQL, &j.Submission.NonAtomicDDL, &j.Driver, &j.Status,
-		&j.WorkerID, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt, &j.ErrorCode)
+		&j.WorkerID, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt, &j.ErrorCode, &j.HeartbeatAt, &j.LeaseUntil)
 	j.StatusURL = fmt.Sprintf("/api/databases/%d/migrations/jobs/%d", j.DatabaseID, j.ID)
 	return j, err
 }
@@ -186,8 +189,50 @@ func NewJobHandler(service *JobService, csrf admin.UserCSRFVerifier) *JobHandler
 }
 
 func RegisterJobRoutes(mux *http.ServeMux, h *JobHandler) {
+	mux.HandleFunc("PUT /api/databases/{database_id}/migrations/jobs/{job_id}/approvals/{group_id}", h.HandleApprove)
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/jobs", h.HandleSubmitJob)
 	mux.HandleFunc("GET /api/databases/{database_id}/migrations/jobs/{job_id}", h.HandleGetJob)
+}
+
+func (h *JobHandler) HandleApprove(w http.ResponseWriter, r *http.Request) {
+	if h.csrf == nil || h.csrf.ValidateCSRF(r) != nil {
+		admin.WriteUserServiceError(w, admin.ErrInvalidUserCSRF)
+		return
+	}
+	id, err := jobDatabaseID(r)
+	job, e1 := strconv.ParseInt(r.PathValue("job_id"), 10, 64)
+	group, e2 := strconv.ParseInt(r.PathValue("group_id"), 10, 32)
+	if err != nil || e1 != nil || e2 != nil || job <= 0 || group <= 0 {
+		writeJobError(w, &InputError{"ID database, job atau group tidak valid"})
+		return
+	}
+	ctx := r.Context()
+	actor, err := h.service.identity.VerifiedUserID(ctx)
+	if err != nil || actor <= 0 {
+		writeJobError(w, admin.ErrUnauthenticated)
+		return
+	}
+	// Only the current active leader can approve this immutable job for their own group.
+	var allowed bool
+	err = h.service.db.QueryRowContext(ctx, `WITH eligible AS (
+	 SELECT j.id,l.group_id,l.user_id FROM platform.migration_jobs j
+	 JOIN platform.group_database_access g ON g.database_id=j.database_id
+	 JOIN platform.group_leaders l ON l.group_id=g.group_id
+	 JOIN platform.users u ON u.id=l.user_id
+	 WHERE j.database_id=$1 AND j.id=$2 AND l.group_id=$3 AND l.user_id=$4 AND u.is_active AND j.status='QUEUED'
+	 FOR SHARE OF j,g,l,u
+	), saved AS (INSERT INTO platform.job_approvals(job_id,group_id,leader_id)
+	 SELECT id,group_id,user_id FROM eligible ON CONFLICT DO NOTHING)
+	 SELECT EXISTS(SELECT 1 FROM eligible)`, id, job, group, actor).Scan(&allowed)
+	if err != nil {
+		writeJobError(w, ErrJobStorage)
+		return
+	}
+	if !allowed {
+		writeJobError(w, access.ErrDatabaseAccessDenied)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *JobHandler) HandleSubmitJob(w http.ResponseWriter, r *http.Request) {

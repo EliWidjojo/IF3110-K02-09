@@ -107,13 +107,69 @@ CREATE INDEX IF NOT EXISTS migration_jobs_database_created ON platform.migration
 CREATE INDEX IF NOT EXISTS migration_jobs_worker_status ON platform.migration_jobs(worker_id, status, id);
 CREATE INDEX IF NOT EXISTS migration_jobs_queued ON platform.migration_jobs(id) WHERE status='QUEUED';
 
+ALTER TABLE platform.database_connections ADD COLUMN IF NOT EXISTS target_version BIGINT NOT NULL DEFAULT 1;
+CREATE OR REPLACE FUNCTION platform.track_target_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF ROW(NEW.host,NEW.port,NEW.database_name,NEW.driver) IS DISTINCT FROM
+    ROW(OLD.host,OLD.port,OLD.database_name,OLD.driver) THEN
+  NEW.target_version = OLD.target_version + 1;
+ ELSE NEW.target_version = OLD.target_version;
+ END IF;
+ RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS track_target_change ON platform.database_connections;
+CREATE TRIGGER track_target_change BEFORE UPDATE ON platform.database_connections
+ FOR EACH ROW EXECUTE FUNCTION platform.track_target_change();
+
+ALTER TABLE platform.migration_jobs
+ ADD COLUMN IF NOT EXISTS target_version BIGINT,
+ ADD COLUMN IF NOT EXISTS lease_token TEXT,
+ ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
+ ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
+ALTER TABLE platform.migration_jobs DROP CONSTRAINT IF EXISTS migration_jobs_status_check;
+ALTER TABLE platform.migration_jobs ADD CONSTRAINT migration_jobs_status_check
+ CHECK (status IN ('QUEUED','RUNNING','READY','SUCCESS','FAILED','NEEDS_REVIEW'));
+-- Existing jobs intentionally retain NULL: their original destination cannot be reconstructed.
+CREATE OR REPLACE FUNCTION platform.capture_job_target() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ SELECT target_version INTO STRICT NEW.target_version FROM platform.database_connections
+ WHERE id=NEW.database_id AND driver=NEW.driver FOR SHARE;
+ RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS capture_job_target ON platform.migration_jobs;
+CREATE TRIGGER capture_job_target BEFORE INSERT ON platform.migration_jobs
+ FOR EACH ROW EXECUTE FUNCTION platform.capture_job_target();
+
+CREATE TABLE IF NOT EXISTS platform.group_leaders (
+ group_id INT PRIMARY KEY, user_id INT NOT NULL,
+ UNIQUE(group_id,user_id),
+ FOREIGN KEY(user_id,group_id) REFERENCES platform.group_memberships(user_id,group_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS platform.job_approvals (
+ job_id BIGINT NOT NULL REFERENCES platform.migration_jobs(id) ON DELETE CASCADE,
+ group_id INT NOT NULL, leader_id INT NOT NULL, approved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ PRIMARY KEY(job_id,group_id),
+ FOREIGN KEY(group_id,leader_id) REFERENCES platform.group_leaders(group_id,user_id) ON DELETE CASCADE
+);
+CREATE OR REPLACE VIEW platform.job_admission AS
+ SELECT j.id, j.target_version=d.target_version AND j.driver=d.driver AS same_target,
+ EXISTS (SELECT 1 FROM platform.users u JOIN platform.group_memberships m ON m.user_id=u.id
+   JOIN platform.group_database_access g ON g.group_id=m.group_id
+   WHERE u.id=j.submitted_by AND u.is_active AND g.database_id=j.database_id
+   AND g.access_level='View + Edit') AS can_edit,
+ EXISTS (SELECT 1 FROM platform.group_database_access WHERE database_id=j.database_id)
+ AND NOT EXISTS (SELECT 1 FROM platform.group_database_access g WHERE g.database_id=j.database_id
+   AND NOT EXISTS (SELECT 1 FROM platform.job_approvals a JOIN platform.users u ON u.id=a.leader_id
+     WHERE a.job_id=j.id AND a.group_id=g.group_id AND u.is_active)) AS approved
+ FROM platform.migration_jobs j JOIN platform.database_connections d ON d.id=j.database_id;
+
 CREATE OR REPLACE FUNCTION platform.preserve_job_submission() RETURNS trigger LANGUAGE plpgsql AS $body$
 BEGIN
  IF ROW(OLD.id, OLD.database_id, OLD.submitted_by, OLD.idempotency_key, OLD.version,
-        OLD.query_sql, OLD.non_atomic_ddl, OLD.driver, OLD.created_at)
+        OLD.query_sql, OLD.non_atomic_ddl, OLD.driver, OLD.created_at, OLD.target_version)
     IS DISTINCT FROM
     ROW(NEW.id, NEW.database_id, NEW.submitted_by, NEW.idempotency_key, NEW.version,
-        NEW.query_sql, NEW.non_atomic_ddl, NEW.driver, NEW.created_at) THEN
+        NEW.query_sql, NEW.non_atomic_ddl, NEW.driver, NEW.created_at, NEW.target_version) THEN
   RAISE EXCEPTION 'job submission is immutable';
  END IF;
  NEW.updated_at = clock_timestamp();
