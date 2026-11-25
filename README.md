@@ -1,8 +1,8 @@
 # Tugas Besar IF3110 — Database Management Platform
 
-**Kelompok K02-09 · Milestone 1 · Atlas**
+**Kelompok K02-09 · Milestone 2 · Atlas**
 
-Atlas adalah platform administrasi database untuk mengelola koneksi, memberikan akses melalui group, menjelajahi schema dan data, serta menjalankan migration SQL dengan pencatatan riwayat. Backend Go menyajikan HTML, CSS bersama, dan vanilla JavaScript tanpa framework frontend.
+Atlas adalah platform administrasi database untuk mengelola koneksi, memberikan akses melalui group, menjelajahi schema dan data, serta menjalankan migration SQL dengan pencatatan riwayat. Backend dan worker ditulis dalam Go; frontend berupa Single-Page Application React + TypeScript yang di-embed ke binary Go dan memisahkan Workspace pengguna dari Admin Console.
 
 Persiapan demonstrasi: [panduan teknis auth, security, migration, query plan, dan pengujian](docs/PANDUAN_DEMO_AUTH_SECURITY.md), termasuk skenario manual, expected status, pemetaan automated test, dan latihan jawaban lisan. Gunakan juga [bank 50 pertanyaan dan skenario demo berdasarkan spesifikasi milestone](docs/BANK_PERTANYAAN_DEMO_MILESTONE_1.md) untuk latihan tanya jawab teknis.
 
@@ -15,6 +15,7 @@ Database PostgreSQL internal menyimpan identitas, group, keanggotaan, grant, dan
 - [Setup dari checkout bersih](#setup-dari-checkout-bersih)
 - [Setup PostgreSQL manual](#setup-postgresql-manual)
 - [Langkah awal penggunaan](#langkah-awal-penggunaan)
+- [Frontend SPA dan pemisahan halaman per role](#frontend-spa-dan-pemisahan-halaman-per-role)
 - [Dokumentasi halaman](#dokumentasi-halaman)
 - [Kebijakan akses dan session](#kebijakan-akses-dan-session)
 - [Migration dan integritas history](#migration-dan-integritas-history)
@@ -35,7 +36,7 @@ Database PostgreSQL internal menyimpan identitas, group, keanggotaan, grant, dan
 | Docker dan Docker Compose | Compose v2 dengan dukungan `up --wait`, bila memakai jalur Docker. Docker Desktop dapat digunakan pada Windows/macOS. |
 | Python | Python 3, tersedia sebagai `python3` untuk script shell pembuat `.env`. |
 | Browser | Browser modern dengan JavaScript, cookie, dan Fetch API. |
-| Node.js | Opsional untuk menjalankan `node --check`; bukan dependency runtime aplikasi. |
+| Node.js | 20+ hanya untuk mengembangkan/membangun ulang SPA; hasil build sudah di-embed sehingga bukan dependency runtime. |
 | MariaDB | Opsional; Compose menggunakan **11.4** untuk bonus DBMS. |
 | Windows | PowerShell dan Git Bash dengan `bash`, `sh`, serta `python3` di PATH; alternatifnya WSL dengan perintah Linux. |
 
@@ -166,7 +167,19 @@ go run ./cmd/server
 go run ./cmd/server
 ```
 
-Buka [http://localhost:8080/](http://localhost:8080/) untuk login. Aplikasi tersedia pada `/platform/`; `GET /healthz` memberikan status HTTP, bukan pemeriksaan menyeluruh seluruh koneksi target. Proses Go tidak memuat `.env` sendiri, sehingga environment harus dimuat pada shell sebelum menjalankannya.
+Buka [http://localhost:8080/](http://localhost:8080/) untuk login. Seluruh aplikasi adalah SPA pada origin yang sama (`/login`, `/databases`, `/admin/...`); URL lama `/platform/` diarahkan ke `/`. `GET /healthz` memberikan status HTTP, bukan pemeriksaan menyeluruh seluruh koneksi target. Proses Go tidak memuat `.env` sendiri, sehingga environment harus dimuat pada shell sebelum menjalankannya.
+
+### 5. Frontend SPA
+
+Hasil build SPA (`web/dist`) ikut di-commit dan di-embed ke binary Go, sehingga langkah 4 cukup untuk menjalankan aplikasi tanpa Node.js. Node.js 20+ hanya diperlukan saat mengubah kode di `web/src`:
+
+```bash
+npm --prefix web ci
+npm --prefix web run dev     # Vite di http://localhost:5173, /api diteruskan ke server Go :8080
+npm --prefix web run build   # perbarui web/dist sebelum commit
+```
+
+Saat memakai server dev Vite, set `APP_ORIGIN=http://localhost:5173` pada server Go agar pemeriksaan Origin/CSRF menerima request dari dev server.
 
 Untuk production, gunakan `APP_ENV=production`, `APP_ORIGIN` HTTPS, dan terminasi TLS/reverse proxy yang sesuai. HTTP server dapat tetap bind localhost di belakang proxy. Gunakan TLS database terverifikasi pada jaringan yang tidak tepercaya; `sslmode=disable` di contoh ini hanya untuk development lokal.
 
@@ -222,20 +235,47 @@ Pada setup manual, DSN internal dan origin harus menunjuk instance lokal yang be
 
 ## Langkah awal penggunaan
 
-1. Login menggunakan akun bootstrap yang dibuat lokal. Buka **Koneksi** pada navbar, lalu isi nama tampilan, DBMS, host, port, database, executor, akun pencatat history, password, dan mode TLS.
-2. Untuk target PostgreSQL Compose, gunakan host `127.0.0.1`, port `55432`, database `atlas_target`, executor `atlas_executor`, dan pencatat `atlas_audit`. Password masing-masing berasal dari `.env` lokal. Untuk MariaDB Compose, gunakan driver MariaDB dan port `53307`.
-3. Simpan konfigurasi dan gunakan **Periksa** untuk menguji koneksi executor. Setup history harus sudah dijalankan melalui `cmd/target-setup`; pemeriksaan privilege history yang lebih lengkap berlangsung saat migration. `config/databases.example.json` adalah contoh konfigurasi/payload, bukan sumber konfigurasi runtime.
-4. Pada **User**, buat pengguna bila diperlukan. Pada **Group & akses**, buat group, pilih **Anggota & akses**, tambahkan ID user, dan berikan ID database dengan tingkat **View Only** atau **View + Edit**. ID dapat dilihat pada daftar user dan koneksi.
-5. Admin platform tidak otomatis dapat mengakses target. Masukkan admin ke group yang memiliki grant jika admin juga perlu menggunakan viewer atau editor. Session akan dirotasi atau dicabut sesuai perubahan izin; perbarui session atau login kembali bila diminta.
-6. Pada **Database**, pilih database, schema, dan table, lalu buka tab Data, Column, Constraint, atau Index. Pagination tersedia di bagian bawah data.
-7. Pada **Migration & history**, pilih database, periksa versi berikutnya, tulis SQL, dan jalankan dengan akses View + Edit. Lihat hasil dan riwayat percobaan. Tidak ada draft yang disimpan; **Salin ke editor** menyalin SQL history ke editor untuk ditinjau, bukan mengubah catatan lama.
-8. Gunakan **Analisis query** untuk meninjau execution plan PostgreSQL. **Schema diff & kandidat migration** berada pada panel migration dan menghasilkan kandidat yang harus ditinjau sebelum dijalankan.
+1. Login di `/login` menggunakan akun bootstrap. Platform Admin langsung masuk ke **Admin Console** (`/admin`); user biasa masuk ke **Workspace** (`/databases`).
+2. Di Admin Console buka **Koneksi database**, isi nama tampilan, DBMS, host, port, database, executor, akun pencatat history, password, dan mode TLS. Untuk target PostgreSQL Compose, gunakan host `127.0.0.1`, port `55432`, database `atlas_target`, executor `atlas_executor`, dan pencatat `atlas_audit`; password berasal dari `.env` lokal. Untuk MariaDB Compose, gunakan driver MariaDB dan port `53307`.
+3. Simpan konfigurasi dan gunakan **Periksa** untuk menguji koneksi executor. Setup history harus sudah dijalankan melalui `cmd/target-setup`. `config/databases.example.json` adalah contoh payload, bukan sumber konfigurasi runtime.
+4. Pada **User**, buat pengguna. Pada **Group & akses**, buat group lalu buka **Anggota, leader & akses**: tambahkan anggota dari daftar user, tetapkan satu **leader**, dan berikan akses database **View Only** atau **View + Edit**.
+5. Admin platform tidak otomatis dapat mengakses target. Masukkan admin ke group yang memiliki grant bila admin juga perlu memakai Workspace (tautan **Workspace →** di header Admin Console).
+6. Di Workspace, **Database** memilih database, schema, dan table, lalu tab Data, Column, Constraint, atau Index dengan pagination. Pilihan tersimpan di URL sehingga dapat di-refresh atau dibagikan.
+7. **Migration** (View + Edit) mengajukan migration baru, rollback, atau forward sebagai job. Job berstatus QUEUED sampai leader setiap group yang memiliki akses menyetujui melalui halaman detail job; worker lalu menjalankannya. Halaman job memantau status, progres batch/row, dan menyediakan retry/pembatalan batch. **Riwayat eksekusi** menampilkan semua attempt dengan checkbox **Hide rollback**.
+8. **Analisis query** meninjau execution plan PostgreSQL. **Schema diff & kandidat migration** berada di halaman Migration; kandidat disalin ke editor untuk ditinjau sebelum diajukan.
 
 Password executor dan pencatat dienkripsi AES-256-GCM dengan nonce acak dan AAD ID koneksi. Respons hanya berisi metadata serta indikator konfigurasi password. Saat edit, password yang tidak dikirim dipertahankan; pengosongan memerlukan pilihan eksplisit. Perubahan atau penghapusan konfigurasi menginvalidasi pool terkait.
 
+## Frontend SPA dan pemisahan halaman per role
+
+Frontend adalah **Single-Page Application React + TypeScript** (Vite, React Router, TanStack Query) di folder `web/`. Halaman login dan administrasi juga bagian dari SPA. Navigasi tidak memuat ulang halaman; data diambil dari API Go dengan loading state, dan status job dipantau otomatis setiap 1,5–2 detik selama job masih QUEUED/RUNNING/RECOVERING/BLOCKED.
+
+| Area | Route | Siapa | Isi |
+| --- | --- | --- | --- |
+| Login | `/login` | Semua | Form login; setelah berhasil diarahkan sesuai role. |
+| Workspace | `/databases`, `/migrations`, `/migrations/:db/jobs/:id`, `/analysis` | User dengan grant (termasuk admin yang menjadi anggota group) | Viewer, pengajuan dan pemantauan job, approval leader, riwayat, analisis query. |
+| Admin Console | `/admin/users`, `/admin/groups`, `/admin/groups/:id`, `/admin/connections` | Hanya Platform Admin | User, group, anggota, leader, akses database, dan koneksi. |
+
+- Admin Console memiliki layout, warna, dan navigasi sendiri, dan kodenya dimuat sebagai **chunk JavaScript terpisah** (`React.lazy`). User biasa tidak pernah mengunduh kode halaman admin dan tidak melihat menu admin; membuka `/admin/...` diarahkan kembali ke Workspace.
+- Di Workspace, kontrol mengikuti akses efektif per database: View Only hanya melihat; View + Edit dapat mengajukan migration; tombol **Setujui sebagai leader** hanya muncul untuk group yang dipimpin user (`leader_groups` dari `/api/platform/me`).
+- Pemisahan di frontend hanya tampilan; setiap API tetap memeriksa session, CSRF, dan hak akses di backend.
+- Seluruh halaman responsif: navigasi menjadi menu pada layar < 720 px, form menjadi satu kolom, dan tabel lebar di-scroll di dalam komponennya sendiri.
+
+Endpoint baca yang ditambahkan untuk SPA:
+
+| Endpoint | Hak | Isi |
+| --- | --- | --- |
+| `GET /api/databases/{id}/migrations/jobs?limit&offset` | View Only / View + Edit | Daftar job terbaru pada database. |
+| `GET /api/databases/{id}/migrations/jobs/{job}/approvals` | View Only / View + Edit | Group yang wajib menyetujui, leader-nya, dan status approval putaran saat ini. |
+| `GET /api/admin/groups/{id}/leader` | Platform Admin | Leader group saat ini. |
+| `GET /api/platform/me` (field `leader_groups`) | User login | Group yang dipimpin user. |
+
+**Hide rollback** menyembunyikan attempt yang dibatalkan beserta attempt rollback sukses yang membatalkannya. Pasangan ditentukan berdasarkan execution ID (`attempt_id` job rollback dan job sumbernya), bukan nama migration. Attempt gagal, rollback gagal, dan forward tetap terlihat; filter tidak menghapus data history.
 ## Dokumentasi halaman
 
-Screenshot berikut diambil dari aplikasi terbaru yang dijalankan dengan backend dan database PostgreSQL disposable, bukan gambar referensi atau respons API mock. Viewport desktop konsisten **1440 × 1000**; screenshot halaman penuh digunakan bila diperlukan. Semua nama akun dan data inventaris bersifat fiktif; password tidak ditampilkan. Database/akun sementara dibersihkan setelah pengambilan gambar. Data demo pada gambar tidak otomatis tersedia setelah setup.
+> Catatan Milestone 2: screenshot di bawah masih berasal dari antarmuka Milestone 1 dan perlu diambil ulang dari SPA.
+
+Screenshot berikut diambil dari aplikasi yang dijalankan dengan backend dan database PostgreSQL disposable, bukan gambar referensi atau respons API mock. Viewport desktop konsisten **1440 × 1000**; screenshot halaman penuh digunakan bila diperlukan. Semua nama akun dan data inventaris bersifat fiktif; password tidak ditampilkan. Database/akun sementara dibersihkan setelah pengambilan gambar. Data demo pada gambar tidak otomatis tersedia setelah setup.
 
 ### Login
 
@@ -438,20 +478,15 @@ go vet ./...
 go test ./...
 ```
 
-Periksa sintaks JavaScript tanpa memasang framework atau dependency frontend:
+Frontend SPA (typecheck, unit test Vitest, dan build ke `web/dist`); perintah sama pada bash dan PowerShell:
 
 ```bash
-for file in internal/dashboard/web/*.js; do node --check "$file" || exit 1; done
+npm --prefix web ci
+npm --prefix web test
+npm --prefix web run build
 ```
 
-Padanan PowerShell:
-
-```powershell
-Get-ChildItem internal/dashboard/web/*.js | ForEach-Object {
-    node --check $_.FullName
-    if ($LASTEXITCODE -ne 0) { throw "Sintaks JavaScript gagal: $($_.Name)" }
-}
-```
+Unit test frontend mencakup pemisahan route per role (user biasa tidak dapat membuka Admin Console, admin mendarat di Admin Console, tanpa session diarahkan ke login) dan aturan pasangan **Hide rollback**.
 
 Tanpa `TEST_PLATFORM_DSN`, test integrasi PostgreSQL dilewati secara eksplisit. Tanpa `TEST_MARIADB_ADMIN_DSN`, test MariaDB dilewati. Test alur MariaDB lengkap juga memakai fixture internal PostgreSQL, sehingga memerlukan kedua environment. Kelulusan `go test` tanpa DSN bukan bukti seluruh integrasi database dijalankan.
 
@@ -554,8 +589,8 @@ Screenshot dokumentasi diambil ulang dengan data inventaris fiktif pada versi fr
 | Teknologi | Penggunaan aktual |
 | --- | --- |
 | Go 1.25 | HTTP server `net/http`, session, CSRF, service, dan akses database melalui `database/sql`. |
-| HTML, CSS, vanilla JavaScript | Frontend yang disajikan oleh Go; tidak memakai framework frontend atau build Node.js. |
-| `embed` | Menyertakan HTML, CSS, dan JavaScript dashboard ke binary Go. |
+| React 19 + TypeScript, Vite | Frontend SPA di `web/`; React Router untuk route per role, TanStack Query untuk fetch/polling, Vitest + Testing Library untuk unit test. |
+| `embed` | Menyertakan hasil build SPA (`web/dist`) ke binary Go. |
 | PostgreSQL | Penyimpanan internal dan DBMS target utama. |
 | MariaDB / driver MySQL | Target tambahan; kompatibilitas server MySQL belum diklaim teruji. |
 | `github.com/lib/pq` | Driver PostgreSQL. |
@@ -578,7 +613,7 @@ internal/platform/      Schema internal dan integrasi module
 internal/viewer/        Metadata schema dan data table
 internal/migration/     Eksekusi, history, validasi, dan schema diff
 internal/queryanalysis/ Execution plan PostgreSQL
-internal/dashboard/web/ HTML, CSS bersama, vanilla JavaScript
+web/                    SPA React + TypeScript (src/), hasil build (dist/), embed.go
 internal/server/        Integrasi route, login, dan test alur
 internal/testutil/      Helper database disposable
 scripts/                Generator environment dan init database
