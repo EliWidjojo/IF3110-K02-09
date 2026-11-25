@@ -3,3 +3,6 @@
 /.env
 /coverage.out
 *.exe
+
+/web/node_modules/
+/web/*.tsbuildinfo
