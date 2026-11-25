@@ -335,6 +335,112 @@ func RegisterJobRoutes(mux *http.ServeMux, h *JobHandler) {
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/execute", h.HandleSubmitJob)
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/jobs", h.HandleSubmitJob)
 	mux.HandleFunc("GET /api/databases/{database_id}/migrations/jobs/{job_id}", h.HandleGetJob)
+	mux.HandleFunc("GET /api/databases/{database_id}/migrations/jobs", h.HandleListJobs)
+	mux.HandleFunc("GET /api/databases/{database_id}/migrations/jobs/{job_id}/approvals", h.HandleListApprovals)
+}
+
+// ListJobs membaca job terbaru pada satu database untuk dipantau SPA; hanya perlu hak baca.
+func (s *JobService) ListJobs(ctx context.Context, databaseID, limit, offset int) ([]Job, error) {
+	if databaseID <= 0 || limit < 1 || limit > 100 || offset < 0 {
+		return nil, &InputError{"ID database atau pagination tidak valid"}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := s.access.RequireRead(ctx, databaseID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM platform.migration_jobs
+		WHERE database_id=$1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`, databaseID, limit, offset)
+	if err != nil {
+		return nil, ErrJobStorage
+	}
+	defer rows.Close()
+	jobs := []Job{}
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, ErrJobStorage
+		}
+		jobs = append(jobs, j)
+	}
+	if rows.Err() != nil {
+		return nil, ErrJobStorage
+	}
+	return jobs, nil
+}
+
+// JobApproval menunjukkan status approval putaran saat ini untuk setiap group yang memiliki akses.
+type JobApproval struct {
+	GroupID        int        `json:"group_id"`
+	GroupName      string     `json:"group_name"`
+	LeaderID       *int       `json:"leader_id"`
+	LeaderUsername *string    `json:"leader_username"`
+	Approved       bool       `json:"approved"`
+	ApprovedAt     *time.Time `json:"approved_at"`
+}
+
+func (s *JobService) ListApprovals(ctx context.Context, databaseID int, jobID int64) ([]JobApproval, error) {
+	if _, err := s.GetJob(ctx, databaseID, jobID); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `SELECT g.group_id, gr.name, l.user_id, u.username, a.approved_at
+		FROM platform.migration_jobs j
+		JOIN platform.group_database_access g ON g.database_id=j.database_id
+		JOIN platform.groups gr ON gr.id=g.group_id
+		LEFT JOIN platform.group_leaders l ON l.group_id=g.group_id
+		LEFT JOIN platform.users u ON u.id=l.user_id
+		LEFT JOIN platform.job_approvals a ON a.job_id=j.id AND a.group_id=g.group_id
+		WHERE j.database_id=$1 AND j.id=$2 ORDER BY gr.name, g.group_id`, databaseID, jobID)
+	if err != nil {
+		return nil, ErrJobStorage
+	}
+	defer rows.Close()
+	approvals := []JobApproval{}
+	for rows.Next() {
+		var a JobApproval
+		if err := rows.Scan(&a.GroupID, &a.GroupName, &a.LeaderID, &a.LeaderUsername, &a.ApprovedAt); err != nil {
+			return nil, ErrJobStorage
+		}
+		a.Approved = a.ApprovedAt != nil
+		approvals = append(approvals, a)
+	}
+	if rows.Err() != nil {
+		return nil, ErrJobStorage
+	}
+	return approvals, nil
+}
+
+func (h *JobHandler) HandleListJobs(w http.ResponseWriter, r *http.Request) {
+	databaseID, err := jobDatabaseID(r)
+	limit, e1 := httpapi.PaginationValue(r, "limit", 20)
+	offset, e2 := httpapi.PaginationValue(r, "offset", 0)
+	if err != nil || e1 != nil || e2 != nil {
+		writeJobError(w, &InputError{"ID database atau pagination tidak valid"})
+		return
+	}
+	jobs, err := h.service.ListJobs(r.Context(), databaseID, limit, offset)
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, jobs, nil)
+}
+
+func (h *JobHandler) HandleListApprovals(w http.ResponseWriter, r *http.Request) {
+	databaseID, err := jobDatabaseID(r)
+	jobID, e := strconv.ParseInt(r.PathValue("job_id"), 10, 64)
+	if err != nil || e != nil || jobID <= 0 {
+		writeJobError(w, &InputError{"ID database atau job tidak valid"})
+		return
+	}
+	approvals, err := h.service.ListApprovals(r.Context(), databaseID, jobID)
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, approvals, nil)
 }
 
 // Re-read authoritative history after an operator has restored connectivity
