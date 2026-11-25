@@ -18,6 +18,7 @@ Database PostgreSQL internal menyimpan identitas, group, keanggotaan, grant, dan
 - [Dokumentasi halaman](#dokumentasi-halaman)
 - [Kebijakan akses dan session](#kebijakan-akses-dan-session)
 - [Migration dan integritas history](#migration-dan-integritas-history)
+- [Activity logging dan tracing](#activity-logging-dan-tracing)
 - [Batas viewer dan representasi data](#batas-viewer-dan-representasi-data)
 - [Bonus dan batas dukungan](#bonus-dan-batas-dukungan)
 - [Impor instalasi lama](#impor-instalasi-lama)
@@ -404,6 +405,49 @@ Worker mendukung tabel biasa dengan primary key integer tunggal bernama `id` yan
 
 Untuk mengulang pengukuran, gunakan cluster uji disposable, set `TEST_PLATFORM_DSN` serta `TEST_LARGE_BATCH=1`, lalu jalankan `go test ./internal/server -run TestLargeQueuedBatch -count=1 -v`. Pada pengujian lokal, UPDATE 250.000 row memerlukan 1,104 detik. Setelah transaksi baseline dibatalkan, job memproses dataset yang sama dalam 25 batch berukuran 10.000 dalam 1,490 detik dari pengajuan hingga hasil dibaca.
 
+## Activity logging dan tracing
+
+Server (`cmd/server`) dan worker (`cmd/worker`) menulis **structured log JSON** melalui `log/slog` ke **stdout** dan span **OpenTelemetry** melalui exporter console ke **stderr**. Log dan span tidak disimpan di database platform dan tidak ditampilkan di SPA. Seluruh kode berada di `internal/observability/` (`observability.go` untuk logger, span, middleware HTTP, dan propagasi; `sqldriver.go` untuk instrumentasi SQL).
+
+| Environment | Fungsi |
+| --- | --- |
+| `LOG_LEVEL` | `info` (default) atau `debug`. Debug juga menampilkan setiap query sukses ke database internal platform. |
+| `OTEL_TRACES_EXPORTER` | Kosong: span dicetak ke stderr. `none`: exporter dimatikan; trace ID tetap dibuat sehingga log masih memuat `trace_id`/`span_id`. |
+
+Contoh memisahkan keduanya: `go run ./cmd/worker > worker.log.jsonl 2> worker.spans.jsonl`.
+
+### Atribut log
+
+Setiap baris memuat `time`, `level`, `event`, `service`, dan bila tersedia `actor` (ID user terverifikasi), `database_id`, `status`, `request_id`, `trace_id`, `span_id`, `job_id`, `attempt_id`, `batch`, dan `batch_attempt`. Atribut korelasi ditempelkan ke context sekali (`observability.With`) sehingga ikut pada seluruh log dan query berikutnya.
+
+| Event | Kapan dicatat | Atribut tambahan |
+| --- | --- | --- |
+| `http.request` | Setiap request `/api/*`, termasuk yang ditolak auth/CSRF | `method`, `route` (segmen numerik menjadi `{id}`), `http_status`, `duration_ms` |
+| `auth.login`, `auth.logout` | Login sukses/gagal/rate limited dan logout | `username` (tanpa password) |
+| `migration.job.submit` | Job masuk queue atau ditolak | `version`, `operation`, `source_job`, `batch_size` |
+| `migration.job.approve` | Approval leader diterima atau ditolak | `group_id`, `retry_count` |
+| `migration.batch.retry_request`, `migration.batch.cancel_request`, `migration.job.recovery_request` | Pengajuan retry/pembatalan/pemeriksaan ulang | `request_number` |
+| `worker.job.claim`, `worker.job.result`, `worker.job.done` | Worker mengambil job, menetapkan status akhir, dan selesai memproses | `worker_id`, `previous_status`, `error_code`, `committed_batches`, `committed_rows` |
+| `worker.job.retry_scheduled` | Kegagalan sementara dijadwalkan ulang dengan jeda eksponensial | `delay_seconds`, `recovery_count` |
+| `worker.lock` | Lock database target diperoleh, sibuk, gagal, atau dilepas | `wait_ms` |
+| `migration.attempt.registered` | Attempt history target dibuat | `attempt_id` |
+| `migration.batch` | Satu transaksi batch commit atau rollback | `rows`, `duration_ms`, `sqlstate` |
+| `sql.start`, `sql.finish` | Setiap query/exec SQL, termasuk viewer read-only, analisis, migration, dan batch | `db_system`, `db_role`, `query` (maks. 4 KiB), `params`, `duration_ms`, `rows`, `error`, `sqlstate` |
+| `sql.begin`, `sql.commit`, `sql.rollback` | Awal dan akhir transaksi, dicatat terpisah dari query | `duration_ms` sejak BEGIN |
+
+Aktivitas administrasi (user, group, leader, grant, koneksi) tercatat melalui `http.request` dengan `method`, `route`, `actor`, dan `http_status`.
+
+### Trace OpenTelemetry
+
+Rantai span: `POST /api/databases/{id}/migrations/jobs` → (trace context disimpan sebagai W3C `traceparent` di kolom `platform.migration_jobs.trace_context`) → `worker.process` → `worker.lock` → `migration.batch` → `db.exec`/`db.query`/`db.transaction`. Span worker adalah anak dari span API walaupun berjalan di proses lain. Durasi dicatat pada setiap span; error dicatat dengan `RecordError` dan status `Error`, termasuk `db.response.status_code` berisi SQLSTATE.
+
+### Penyamaran data sensitif
+
+- Atribut yang namanya mengandung `password`, `secret`, `token`, `cookie`, `csrf`, `session`, `dsn`, `credential`, `authorization`, atau `capability` diganti `[REDACTED]`.
+- Header `Cookie` dan `X-CSRF-Token`, query string, dan body request tidak pernah dicatat.
+- Parameter SQL bertipe teks/biner ditampilkan sebagai `***(text,<panjang>)`; hanya angka, boolean, NULL, dan waktu yang ditampilkan apa adanya. Capability attempt dan hash password selalu berupa parameter sehingga tidak muncul.
+- Untuk error PostgreSQL hanya pesan utama dan SQLSTATE yang dicatat, tanpa detail baris.
+
 ## Batas viewer dan representasi data
 
 Viewer menampilkan schema, table, column, constraint, index, dan data. Identifier divalidasi dan di-quote terpisah; nilai pagination memakai parameter SQL. Ukuran halaman 1–100 (default 50), hasil data maksimum 2 MiB, timeout operasi 5 detik. Primary key dipakai untuk urutan stabil; tanpa primary key, UI menjelaskan bahwa urutan tidak dijamin. Perubahan data bersamaan tetap dapat menggeser halaman berbasis offset.
@@ -560,6 +604,8 @@ Screenshot dokumentasi diambil ulang dengan data inventaris fiktif pada versi fr
 | MariaDB / driver MySQL | Target tambahan; kompatibilitas server MySQL belum diklaim teruji. |
 | `github.com/lib/pq` | Driver PostgreSQL. |
 | `github.com/go-sql-driver/mysql` | Driver MariaDB/MySQL. |
+| `go.opentelemetry.io/otel` (+ `sdk`, `stdouttrace`) | Tracing OpenTelemetry API → queue → worker → lock → query dengan exporter console. |
+| `log/slog` | Structured log JSON ke stdout. |
 | `github.com/wasilibs/go-pgquery` | Parsing AST SQL PostgreSQL untuk validasi; dependency transitif tercatat di `go.mod`. |
 | `crypto/pbkdf2`, SHA-256, AES-GCM | Hash password dan enkripsi kredensial koneksi. |
 | Docker Compose dan Python 3 | Provisioning development dan generator secret lokal; bukan dependency runtime frontend. |
@@ -578,6 +624,7 @@ internal/platform/      Schema internal dan integrasi module
 internal/viewer/        Metadata schema dan data table
 internal/migration/     Eksekusi, history, validasi, dan schema diff
 internal/queryanalysis/ Execution plan PostgreSQL
+internal/observability/ Structured log JSON, tracing OpenTelemetry, instrumentasi SQL
 internal/dashboard/web/ HTML, CSS bersama, vanilla JavaScript
 internal/server/        Integrasi route, login, dan test alur
 internal/testutil/      Helper database disposable
