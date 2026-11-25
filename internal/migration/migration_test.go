@@ -506,3 +506,131 @@ func TestForwardAndRollbackLifecycle(t *testing.T) {
 		t.Fatalf("latest_version seharusnya mundur ke 1, dapat: %d (err=%v)", latest, err)
 	}
 }
+
+type asyncJob struct {
+	databaseID int
+	proposalID int64
+	direction  migration.MigrationDirection
+}
+
+type testAsyncWorker struct {
+	jobs   chan asyncJob
+	done   chan error
+	engine *migration.Engine
+}
+
+func newTestAsyncWorker(engine *migration.Engine) *testAsyncWorker {
+	return &testAsyncWorker{
+		jobs:   make(chan asyncJob, 10),
+		done:   make(chan error, 10),
+		engine: engine,
+	}
+}
+
+func (w *testAsyncWorker) EnqueueMigration(_ context.Context, dbID int, propID int64, dir migration.MigrationDirection) error {
+	w.jobs <- asyncJob{databaseID: dbID, proposalID: propID, direction: dir}
+	return nil
+}
+
+func (w *testAsyncWorker) start(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case job := <-w.jobs:
+				prop, err := w.engine.GetProposal(ctx, job.databaseID, job.proposalID)
+				if err != nil {
+					w.done <- err
+					continue
+				}
+				res, runErr := w.engine.Run(ctx, job.databaseID, migration.MigrationRequest{
+					Version:      prop.Version,
+					Description:  prop.Description,
+					QuerySQL:     prop.QuerySQL,
+					RollbackSQL:  prop.RollbackSQL,
+					NonAtomicDDL: prop.NonAtomicDDL,
+				})
+				finalStatus := migration.StatusExecuted
+				if runErr != nil {
+					finalStatus = migration.StatusFailed
+				}
+				markErr := w.engine.MarkProposalOutcome(ctx, job.databaseID, job.proposalID, finalStatus, res.AttemptID)
+				if runErr != nil {
+					w.done <- runErr
+				} else {
+					w.done <- markErr
+				}
+			}
+		}
+	}()
+}
+
+func TestAsyncProposalExecution_EndToEnd(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Tambahkan reviewer (user_id = 2)
+	if _, err := f.internal.DB.Exec(`INSERT INTO platform.users(username,password_hash) VALUES('reviewer','hash')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.internal.DB.Exec(`INSERT INTO platform.group_memberships(user_id,group_id) VALUES(2,1)`); err != nil {
+		t.Fatal(err)
+	}
+	reviewerEngine := f.engineAsUser(2)
+
+	// Pasang dan jalankan background worker async
+	worker := newTestAsyncWorker(f.engine)
+	worker.start(ctx)
+	f.engine.SetDispatcher(worker)
+
+	// 1. Submit proposal
+	prop, err := f.engine.SubmitProposal(ctx, f.id, migration.MigrationRequest{
+		Version:     1,
+		Description: "Async create payments table",
+		QuerySQL:    "CREATE TABLE public.payments(id INT PRIMARY KEY, amount INT NOT NULL)",
+		RollbackSQL: "DROP TABLE public.payments",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Approve oleh reviewer
+	if _, err := reviewerEngine.ApproveProposal(ctx, f.id, prop.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Masukkan ke antrean async worker -> status langsung QUEUED tanpa menunggu eksekusi SQL selesai
+	queued, err := f.engine.QueueApprovedProposal(ctx, f.id, prop.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Status != migration.StatusQueued {
+		t.Fatalf("status setelah dispatch seharusnya QUEUED, dapat: %s", queued.Status)
+	}
+
+	// 4. Tunggu background worker selesai memproses job
+	select {
+	case workerErr := <-worker.done:
+		if workerErr != nil {
+			t.Fatalf("worker gagal mengeksekusi migration: %v", workerErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout menunggu async worker selesai")
+	}
+
+	// 5. Verifikasi proposal berubah menjadi EXECUTED dan tabel benar-benar terbuat di target DB
+	finalProp, err := f.engine.GetProposal(ctx, f.id, prop.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalProp.Status != migration.StatusExecuted || finalProp.AttemptID == nil {
+		t.Fatalf("proposal seharusnya berstatus EXECUTED dengan AttemptID terisi: %+v", finalProp)
+	}
+
+	var tableCount int
+	if err := f.roles.Executor.QueryRow(`SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='payments'`).Scan(&tableCount); err != nil || tableCount != 1 {
+		t.Fatalf("tabel payments tidak ditemukan setelah async execution: count=%d, err=%v", tableCount, err)
+	}
+}
