@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"IF3110-K02-09/internal/observability"
 	"github.com/go-sql-driver/mysql"
 	"github.com/lib/pq"
 )
@@ -167,13 +168,13 @@ func openConfiguredTarget(ctx context.Context, credentials DatabaseConnectionCre
 		if err != nil {
 			return nil, ErrInvalidDatabaseConnection
 		}
-		db = sql.OpenDB(connector)
+		db = sql.OpenDB(observability.WrapConnector(connector, observability.DB{System: "mysql", Role: "target"}))
 	} else {
 		connector, err := newTargetPostgresConnector(credentials, timeout)
 		if err != nil {
 			return nil, err
 		}
-		db = sql.OpenDB(connector)
+		db = sql.OpenDB(observability.WrapConnector(connector, observability.DB{System: "postgresql", Role: "target"}))
 	}
 	db.SetMaxOpenConns(5)
 	db.SetMaxIdleConns(1)

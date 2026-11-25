@@ -4,13 +4,14 @@ import (
 	"IF3110-K02-09/internal/admin"
 	"IF3110-K02-09/internal/auth"
 	"IF3110-K02-09/internal/database"
+	"IF3110-K02-09/internal/observability"
 	"IF3110-K02-09/internal/platform"
 	"IF3110-K02-09/internal/server"
 	"context"
 	"database/sql"
 	"errors"
-	_ "github.com/lib/pq"
-	"log"
+	"github.com/lib/pq"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,10 +32,11 @@ func run() error {
 	if dsn == "" {
 		return errors.New("PLATFORM_DATABASE_DSN wajib tersedia")
 	}
-	db, err := sql.Open("postgres", dsn)
+	connector, err := pq.NewConnector(dsn)
 	if err != nil {
 		return errors.New("konfigurasi database internal tidak valid")
 	}
+	db := sql.OpenDB(observability.WrapConnector(connector, observability.DB{System: "postgresql", Role: "platform"}))
 	defer db.Close()
 	db.SetMaxOpenConns(15)
 	db.SetMaxIdleConns(3)
@@ -89,7 +91,7 @@ func run() error {
 		defer done()
 		_ = app.Shutdown(shutdown)
 	}()
-	log.Print("Database platform started")
+	slog.Info("server.started", "addr", app.Addr)
 	err = app.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -97,7 +99,18 @@ func run() error {
 	return errors.New("server HTTP berhenti")
 }
 func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
+	shutdown, err := observability.Setup("atlas-server")
+	if err != nil {
+		slog.Error("server.stopped", "status", "error", "error", err.Error())
+		os.Exit(1)
 	}
+	err = run()
+	flush, done := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = shutdown(flush)
+	done()
+	if err != nil {
+		slog.Error("server.stopped", "status", "error", "error", err.Error())
+		os.Exit(1)
+	}
+	slog.Info("server.stopped", "status", "success")
 }
