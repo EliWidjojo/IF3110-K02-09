@@ -67,7 +67,6 @@ CREATE TABLE IF NOT EXISTS platform_migrations.batch_checkpoints(
  ALTER TABLE platform_migrations.batch_checkpoints ADD COLUMN IF NOT EXISTS recovery JSONB,
    ADD COLUMN IF NOT EXISTS reverted_at TIMESTAMPTZ;
  CREATE INDEX IF NOT EXISTS batch_pending_revert ON platform_migrations.batch_checkpoints(attempt_id,batch_no) WHERE reverted_at IS NULL;
- CREATE INDEX IF NOT EXISTS batch_pending_revert ON platform_migrations.batch_checkpoints(attempt_id,batch_no) WHERE reverted_at IS NULL;
  CREATE TABLE IF NOT EXISTS platform_migrations.batch_scope(
   attempt_id BIGINT NOT NULL REFERENCES platform_migrations.attempts(id),
   batch_no BIGINT NOT NULL CHECK(batch_no > 0),
