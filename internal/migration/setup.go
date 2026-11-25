@@ -32,12 +32,30 @@ func SetupPostgresHistory(ctx context.Context, db *sql.DB, executor string) erro
  CREATE TABLE IF NOT EXISTS platform_migrations.attempts(
   id BIGSERIAL PRIMARY KEY,version INT NOT NULL CHECK(version>0),executed_by INT NOT NULL,
   executed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),finished_at TIMESTAMPTZ,
-  status TEXT NOT NULL CHECK(status IN ('RUNNING','SUCCESS','FAILED','INTERRUPTED','NEEDS_REVIEW')),
+  status TEXT NOT NULL CHECK(status IN ('RUNNING','SUCCESS','FAILED','INTERRUPTED','NEEDS_REVIEW','ROLLED_BACK','ROLLBACK_FAILED')),
   query_sql TEXT NOT NULL,sql_state TEXT NOT NULL DEFAULT '',error_code TEXT NOT NULL DEFAULT '',
   capability_hash BYTEA UNIQUE,legacy_source_id BIGINT UNIQUE
  );
+ ALTER TABLE platform_migrations.attempts DROP CONSTRAINT IF EXISTS attempts_status_check;
+ ALTER TABLE platform_migrations.attempts ADD CONSTRAINT attempts_status_check CHECK(status IN ('RUNNING','SUCCESS','FAILED','INTERRUPTED','NEEDS_REVIEW','ROLLED_BACK','ROLLBACK_FAILED'));
  ALTER TABLE platform_migrations.attempts ADD COLUMN IF NOT EXISTS legacy_source_id BIGINT UNIQUE;
  CREATE TABLE IF NOT EXISTS platform_migrations.legacy_sources(id INT PRIMARY KEY CHECK(id=1),fingerprint TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS platform_migrations.proposals(
+  id BIGSERIAL PRIMARY KEY,
+  version INT NOT NULL CHECK(version>0),
+  description TEXT NOT NULL DEFAULT '',
+  query_sql TEXT NOT NULL,
+  rollback_sql TEXT NOT NULL,
+  non_atomic_ddl BOOLEAN NOT NULL DEFAULT FALSE,
+  checksum TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('PENDING_APPROVAL','APPROVED','REJECTED','QUEUED','EXECUTED','ROLLED_BACK','FAILED')),
+  created_by INT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  reviewed_by INT,
+  reviewed_at TIMESTAMPTZ,
+  rejection_reason TEXT NOT NULL DEFAULT '',
+  attempt_id BIGINT REFERENCES platform_migrations.attempts(id)
+ );
  CREATE UNIQUE INDEX IF NOT EXISTS one_successful_version ON platform_migrations.attempts(version) WHERE status='SUCCESS';
  REVOKE ALL ON ALL TABLES IN SCHEMA platform_migrations FROM PUBLIC;
  REVOKE ALL ON ALL SEQUENCES IN SCHEMA platform_migrations FROM PUBLIC;

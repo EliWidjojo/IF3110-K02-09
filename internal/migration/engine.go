@@ -48,13 +48,18 @@ type ExecutionResult struct {
 	SQLState  string `json:"sql_state,omitempty"`
 }
 type Engine struct {
-	access   access.DatabasePermissionChecker
-	pools    *database.TargetConnectionManager
-	identity admin.VerifiedUserProvider
+	access     access.DatabasePermissionChecker
+	pools      *database.TargetConnectionManager
+	identity   admin.VerifiedUserProvider
+	dispatcher AsyncDispatcher
 }
 
 func NewEngine(a access.DatabasePermissionChecker, p *database.TargetConnectionManager, i admin.VerifiedUserProvider) *Engine {
-	return &Engine{a, p, i}
+	return &Engine{access: a, pools: p, identity: i}
+}
+
+func (e *Engine) SetDispatcher(d AsyncDispatcher) {
+	e.dispatcher = d
 }
 
 func (e *Engine) Run(ctx context.Context, id int, req MigrationRequest) (ExecutionResult, error) {

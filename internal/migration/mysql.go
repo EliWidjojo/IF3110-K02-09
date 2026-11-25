@@ -27,6 +27,7 @@ func SetupMySQLHistory(ctx context.Context, db *sql.DB, target, executor string)
 		"CREATE DATABASE IF NOT EXISTS " + schema,
 		"CREATE TABLE IF NOT EXISTS " + schema + `.attempts(id BIGINT AUTO_INCREMENT PRIMARY KEY,version INT NOT NULL,executed_by INT NOT NULL,executed_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),finished_at TIMESTAMP(6) NULL,status VARCHAR(20) NOT NULL,query_sql MEDIUMTEXT NOT NULL,sql_state VARCHAR(5) NOT NULL DEFAULT '',error_code VARCHAR(40) NOT NULL DEFAULT '',capability_hash CHAR(64) UNIQUE,legacy_source_id BIGINT UNIQUE,successful_version INT GENERATED ALWAYS AS(CASE WHEN status='SUCCESS' THEN version ELSE NULL END) STORED,UNIQUE(successful_version)) ENGINE=InnoDB`,
 		"CREATE TABLE IF NOT EXISTS " + schema + ".legacy_sources(id INT PRIMARY KEY,fingerprint VARCHAR(64) NOT NULL) ENGINE=InnoDB",
+		"CREATE TABLE IF NOT EXISTS " + schema + `.proposals(id BIGINT AUTO_INCREMENT PRIMARY KEY,version INT NOT NULL,description VARCHAR(255) NOT NULL DEFAULT '',query_sql MEDIUMTEXT NOT NULL,rollback_sql MEDIUMTEXT NOT NULL,non_atomic_ddl BOOLEAN NOT NULL DEFAULT FALSE,checksum VARCHAR(64) NOT NULL,status VARCHAR(32) NOT NULL,created_by INT NOT NULL,created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),reviewed_by INT NULL,reviewed_at TIMESTAMP(6) NULL,rejection_reason TEXT NOT NULL,attempt_id BIGINT NULL) ENGINE=InnoDB`,
 		"CREATE OR REPLACE SQL SECURITY DEFINER VIEW " + schema + `.history AS SELECT id,version,executed_by,executed_at,finished_at,status,query_sql,sql_state,error_code FROM ` + schema + `.attempts`,
 		"DROP PROCEDURE IF EXISTS " + schema + `.complete_attempt`,
 		"CREATE PROCEDURE " + schema + `.complete_attempt(IN capability VARCHAR(64)) SQL SECURITY DEFINER MODIFIES SQL DATA BEGIN UPDATE ` + schema + `.attempts SET status='SUCCESS',finished_at=CURRENT_TIMESTAMP(6),capability_hash=NULL WHERE status='RUNNING' AND capability_hash=SHA2(capability,256); IF ROW_COUNT()<>1 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='migration capability rejected'; END IF; END`,
@@ -112,3 +113,4 @@ func (e *Engine) runMySQL(ctx context.Context, target *sql.DB, control *sql.Conn
 	out.Status = "SUCCESS"
 	return out, nil
 }
+

@@ -308,3 +308,201 @@ func TestLostCoordinatorFencesOldTransaction(t *testing.T){
  var old,new int;f.roles.Executor.QueryRow(`SELECT count(*) FROM items WHERE id=2`).Scan(&old);f.roles.Executor.QueryRow(`SELECT count(*) FROM items WHERE id=3`).Scan(&new);if old!=0 || new!=1{t.Fatal("transaction lama melewati pagar")}
  h:=f.history(t);if h[0].Version!=3 || h[0].Status!="SUCCESS" || h[1].Status!="INTERRUPTED"{t.Fatal("history pemulihan tidak konsisten")}
 }
+
+type mockDispatcher struct {
+	called     int
+	databaseID int
+	proposalID int64
+	direction  migration.MigrationDirection
+}
+
+func (m *mockDispatcher) EnqueueMigration(_ context.Context, dbID int, propID int64, dir migration.MigrationDirection) error {
+	m.called++
+	m.databaseID = dbID
+	m.proposalID = propID
+	m.direction = dir
+	return nil
+}
+
+func (f *fixture) engineAsUser(userID int) *migration.Engine {
+	identity := platform.VerifiedIdentityFunc(func(context.Context) (int, error) { return userID, nil })
+	a := access.NewEffectiveAccessService(access.NewEffectiveAccessRepository(f.internal.DB), identity)
+	return migration.NewEngine(a, f.pools, identity)
+}
+
+func TestProposalWorkflow_ApprovalAndSelfApprovalBlocked(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	// Tambahkan user kedua (user_id = 2) ke grup editors agar punya hak View + Edit
+	if _, err := f.internal.DB.Exec(`INSERT INTO platform.users(username,password_hash) VALUES('reviewer','hash')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.internal.DB.Exec(`INSERT INTO platform.group_memberships(user_id,group_id) VALUES(2,1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. User 1 mengajukan proposal
+	prop, err := f.engine.SubmitProposal(ctx, f.id, migration.MigrationRequest{
+		Version:     1,
+		Description: "Tambah tabel orders",
+		QuerySQL:    "CREATE TABLE public.orders(id INT PRIMARY KEY)",
+		RollbackSQL: "DROP TABLE public.orders",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prop.Status != migration.StatusPendingApproval || prop.CreatedBy != 1 {
+		t.Fatalf("status awal tidak sesuai: %+v", prop)
+	}
+
+	// 2. User 1 mencoba approve pengajuannya sendiri -> harus ditolak
+	if _, err := f.engine.ApproveProposal(ctx, f.id, prop.ID); !errors.Is(err, migration.ErrSelfApprovalBlocked) {
+		t.Fatalf("self-approval seharusnya ditolak, dapat: %v", err)
+	}
+
+	// 3. User 2 menyetujui proposal -> harus berhasil
+	reviewerEngine := f.engineAsUser(2)
+	approved, err := reviewerEngine.ApproveProposal(ctx, f.id, prop.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approved.Status != migration.StatusApproved || approved.ReviewedBy == nil || *approved.ReviewedBy != 2 {
+		t.Fatalf("approval gagal tercatat: %+v", approved)
+	}
+
+	// 4. Proposal yang sudah APPROVED tidak bisa di-approve ulang atau di-reject
+	if _, err := reviewerEngine.ApproveProposal(ctx, f.id, prop.ID); !errors.Is(err, migration.ErrInvalidState) {
+		t.Fatalf("double approval seharusnya gagal: %v", err)
+	}
+	if _, err := reviewerEngine.RejectProposal(ctx, f.id, prop.ID, "terlambat"); !errors.Is(err, migration.ErrInvalidState) {
+		t.Fatalf("reject setelah approve seharusnya gagal: %v", err)
+	}
+}
+
+func TestProposalWorkflow_RejectAndAsyncQueue(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	if _, err := f.internal.DB.Exec(`INSERT INTO platform.users(username,password_hash) VALUES('reviewer','hash')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.internal.DB.Exec(`INSERT INTO platform.group_memberships(user_id,group_id) VALUES(2,1)`); err != nil {
+		t.Fatal(err)
+	}
+	reviewerEngine := f.engineAsUser(2)
+
+	// Skenario Reject
+	p1, err := f.engine.SubmitProposal(ctx, f.id, migration.MigrationRequest{
+		Version:     1,
+		Description: "Proposal ditolak",
+		QuerySQL:    "CREATE TABLE public.temp(id INT)",
+		RollbackSQL: "DROP TABLE public.temp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected, err := reviewerEngine.RejectProposal(ctx, f.id, p1.ID, "Nama tabel kurang deskriptif")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Status != migration.StatusRejected || rejected.RejectionReason != "Nama tabel kurang deskriptif" {
+		t.Fatalf("reject tidak tercatat dengan benar: %+v", rejected)
+	}
+
+	// Skenario Queue ke Async Worker (Nate)
+	p2, err := f.engine.SubmitProposal(ctx, f.id, migration.MigrationRequest{
+		Version:     1,
+		Description: "Proposal valid",
+		QuerySQL:    "CREATE TABLE public.customers(id INT PRIMARY KEY)",
+		RollbackSQL: "DROP TABLE public.customers",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reviewerEngine.ApproveProposal(ctx, f.id, p2.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	dispatcher := &mockDispatcher{}
+	f.engine.SetDispatcher(dispatcher)
+
+	queued, err := f.engine.QueueApprovedProposal(ctx, f.id, p2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Status != migration.StatusQueued || dispatcher.called != 1 || dispatcher.proposalID != p2.ID || dispatcher.direction != migration.DirectionForward {
+		t.Fatalf("dispatch ke worker tidak sesuai: status=%s, dispatcher=%+v", queued.Status, dispatcher)
+	}
+}
+
+func TestForwardAndRollbackLifecycle(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	if _, err := f.internal.DB.Exec(`INSERT INTO platform.users(username,password_hash) VALUES('reviewer','hash')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.internal.DB.Exec(`INSERT INTO platform.group_memberships(user_id,group_id) VALUES(2,1)`); err != nil {
+		t.Fatal(err)
+	}
+	reviewerEngine := f.engineAsUser(2)
+
+	// Eksekusi v1 dan v2 melalui proposal workflow (tanpa dispatcher = eksekusi langsung)
+	p1, err := f.engine.SubmitProposal(ctx, f.id, migration.MigrationRequest{
+		Version:     1,
+		Description: "Create users",
+		QuerySQL:    "CREATE TABLE public.app_users(id INT PRIMARY KEY)",
+		RollbackSQL: "DROP TABLE public.app_users",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reviewerEngine.ApproveProposal(ctx, f.id, p1.ID); err != nil {
+		t.Fatal(err)
+	}
+	exec1, err := f.engine.QueueApprovedProposal(ctx, f.id, p1.ID)
+	if err != nil || exec1.Status != migration.StatusExecuted || exec1.AttemptID == nil {
+		t.Fatalf("eksekusi v1 gagal: %+v, err=%v", exec1, err)
+	}
+
+	p2, err := f.engine.SubmitProposal(ctx, f.id, migration.MigrationRequest{
+		Version:     2,
+		Description: "Add email column",
+		QuerySQL:    "ALTER TABLE public.app_users ADD COLUMN email TEXT",
+		RollbackSQL: "ALTER TABLE public.app_users DROP COLUMN email",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reviewerEngine.ApproveProposal(ctx, f.id, p2.ID); err != nil {
+		t.Fatal(err)
+	}
+	exec2, err := f.engine.QueueApprovedProposal(ctx, f.id, p2.ID)
+	if err != nil || exec2.Status != migration.StatusExecuted || exec2.AttemptID == nil {
+		t.Fatalf("eksekusi v2 gagal: %+v, err=%v", exec2, err)
+	}
+
+	// 1. Mencoba rollback v1 padahal v2 masih aktif -> harus ditolak (ErrNotLatestVersion)
+	if _, err := f.engine.Rollback(ctx, f.id, migration.RollbackRequest{AttemptID: *exec1.AttemptID}); !errors.Is(err, migration.ErrNotLatestVersion) {
+		t.Fatalf("rollback loncat versi seharusnya ditolak, dapat: %v", err)
+	}
+
+	// 2. Rollback v2 (versi terakhir) -> harus berhasil dan otomatis mengambil rollback_sql dari proposal
+	rbRes, err := f.engine.Rollback(ctx, f.id, migration.RollbackRequest{AttemptID: *exec2.AttemptID})
+	if err != nil || rbRes.Status != "ROLLED_BACK" {
+		t.Fatalf("rollback v2 gagal: %+v, err=%v", rbRes, err)
+	}
+
+	// Pastikan kolom email benar-benar terhapus di target database
+	var colCount int
+	if err := f.roles.Executor.QueryRow(`SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='app_users' AND column_name='email'`).Scan(&colCount); err != nil || colCount != 0 {
+		t.Fatalf("kolom email masih ada setelah rollback: count=%d, err=%v", colCount, err)
+	}
+
+	// Pastikan latest_version di history mundur kembali ke 1
+	_, latest, err := f.engine.History(ctx, f.id, 10, 0)
+	if err != nil || latest != 1 {
+		t.Fatalf("latest_version seharusnya mundur ke 1, dapat: %d (err=%v)", latest, err)
+	}
+}
