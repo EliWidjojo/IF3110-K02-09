@@ -37,6 +37,7 @@ type PlatformModule struct {
 	migration      *migration.Engine
 	jobs           *migration.JobService
 	security       SecurityDependencies
+	db             *sql.DB
 }
 
 // Komposisi memakai satu repository konfigurasi agar penulisan admin dan pool target berbagi invalidasi yang sama.
@@ -64,6 +65,7 @@ func NewPlatformModule(db *sql.DB, cipher *database.DatabasePasswordCipher, secu
 		migration:      migration.NewEngine(effectiveAccess, pools, security.Identity),
 		jobs:           migration.NewJobService(db, effectiveAccess, pools, security.Identity),
 		security:       security,
+		db:             db,
 	}, nil
 }
 
@@ -114,7 +116,34 @@ func (m *PlatformModule) handleIdentity(w http.ResponseWriter, r *http.Request) 
 		admin.WriteUserServiceError(w, err)
 		return
 	}
-	httpapi.WriteJSON(w, 200, user, nil)
+	// Group yang dipimpin user dipakai SPA untuk menampilkan tombol approval; backend tetap memeriksa ulang saat approve.
+	leads, err := m.leaderGroups(ctx, id)
+	if err != nil {
+		admin.WriteUserServiceError(w, admin.ErrUserDependencyUnavailable)
+		return
+	}
+	httpapi.WriteJSON(w, 200, struct {
+		admin.User
+		LeaderGroups []admin.Group `json:"leader_groups"`
+	}{user, leads}, nil)
+}
+
+func (m *PlatformModule) leaderGroups(ctx context.Context, userID int) ([]admin.Group, error) {
+	rows, err := m.db.QueryContext(ctx, `SELECT g.id, g.name FROM platform.group_leaders l
+		JOIN platform.groups g ON g.id=l.group_id WHERE l.user_id=$1 ORDER BY g.name, g.id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	groups := []admin.Group{}
+	for rows.Next() {
+		var g admin.Group
+		if err := rows.Scan(&g.ID, &g.Name); err != nil {
+			return nil, err
+		}
+		groups = append(groups, g)
+	}
+	return groups, rows.Err()
 }
 
 type VerifiedIdentityFunc func(context.Context) (int, error)

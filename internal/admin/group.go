@@ -37,6 +37,7 @@ type PlatformAdminAuthorizer interface {
 
 type GroupStore interface {
 	SetLeader(context.Context, int, int) error
+	Leader(context.Context, int) (*int, error)
 	Create(context.Context, CreateGroupParams) (Group, error)
 	GetByID(context.Context, int) (Group, error)
 	List(context.Context, int, int) ([]Group, error)
@@ -64,6 +65,27 @@ func (s *GroupService) SetLeader(ctx context.Context, groupID, userID int) error
 		return ErrInvalidGroupInput
 	}
 	return s.store.SetLeader(ctx, groupID, userID)
+}
+
+// Leader mengembalikan ID leader group saat ini, atau nil bila belum ditetapkan.
+func (s *GroupService) Leader(ctx context.Context, groupID int) (*int, error) {
+	if err := s.requireAdmin(ctx); err != nil {
+		return nil, err
+	}
+	if groupID <= 0 {
+		return nil, ErrInvalidGroupInput
+	}
+	return s.store.Leader(ctx, groupID)
+}
+
+func (r *GroupRepository) Leader(ctx context.Context, groupID int) (*int, error) {
+	var leader *int
+	err := r.db.QueryRowContext(ctx, `SELECT l.user_id FROM platform.groups g
+		LEFT JOIN platform.group_leaders l ON l.group_id=g.id WHERE g.id=$1`, groupID).Scan(&leader)
+	if err != nil {
+		return nil, groupRepositoryError("group leader", err)
+	}
+	return leader, nil
 }
 
 func (r *GroupRepository) SetLeader(ctx context.Context, groupID, userID int) error {
