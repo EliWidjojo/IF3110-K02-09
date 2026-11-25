@@ -6,10 +6,12 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"strings"
 	"time"
 
 	"IF3110-K02-09/internal/database"
+	"IF3110-K02-09/internal/observability"
 )
 
 // A claim token identifies one acquisition, even if two processes share a worker name.
@@ -87,6 +89,26 @@ func (w *Worker) ProcessNext(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// Sambungkan span worker ke trace request pengaju yang tersimpan pada job.
+	var parent string
+	_ = w.db.QueryRowContext(ctx, `SELECT trace_context FROM platform.migration_jobs WHERE id=$1`, c.job.ID).Scan(&parent)
+	ctx, span := observability.Start(observability.ExtractTrace(ctx, parent), "worker.process",
+		"worker_id", w.name, "job_id", c.job.ID, "database_id", c.job.DatabaseID, "version", c.job.Submission.Version,
+		"operation", c.job.Submission.Operation, "batch_size", c.job.Submission.BatchSize, "recovery_count", c.job.RecoveryCount)
+	if c.job.AttemptID != nil {
+		ctx = observability.With(ctx, "attempt_id", *c.job.AttemptID)
+	}
+	slog.InfoContext(ctx, "worker.job.claim", "status", "running", "previous_status", string(c.job.Status), "retry_count", c.job.RetryCount)
+	started := time.Now()
+	defer func() {
+		level := slog.LevelInfo
+		if err != nil {
+			level = slog.LevelError
+		}
+		slog.Log(ctx, level, "worker.job.done", "status", map[bool]string{true: "error", false: "processed"}[err != nil],
+			"duration_ms", float64(time.Since(started).Microseconds())/1000)
+		observability.End(span, err)
+	}()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -131,6 +153,12 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		if c.job.retryPending && status == JobFailed && c.job.CommittedBatches > 0 {
 			status = JobPartial
 		}
+		level := slog.LevelInfo
+		if status == JobFailed || status == JobNeedsReview || status == JobPartial {
+			level = slog.LevelWarn
+		}
+		slog.Log(ctx, level, "worker.job.result", "status", string(status), "error_code", code,
+			"committed_batches", c.job.CommittedBatches, "committed_rows", c.job.CommittedRows)
 		// A cancellation may arrive after the last batch boundary. Publish
 		// the actual forward outcome and hand off under the same job row lock.
 		res, err := tx.ExecContext(ctx, `UPDATE platform.migration_jobs SET
@@ -161,6 +189,8 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 			}
 			return finish(JobFailed, code)
 		}
+		slog.WarnContext(ctx, "worker.job.retry_scheduled", "status", "RECOVERING", "error_code", code,
+			"delay_seconds", 1<<c.job.RecoveryCount, "recovery_count", c.job.RecoveryCount+1)
 		res, e := tx.ExecContext(ctx, `UPDATE platform.migration_jobs SET status='RECOVERING',error_code=$3,
 			recovery_count=recovery_count+1,next_attempt_at=clock_timestamp()+$4 * interval '1 second',inspect_only=$5,
 			attempt_id=CASE WHEN $6 THEN NULL ELSE attempt_id END,
@@ -229,8 +259,21 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 	}
 	defer control.Close()
 	lockCtx, cancelLock := context.WithTimeout(ctx, 12*time.Second)
+	lockCtx, lockSpan := observability.Start(lockCtx, "worker.lock")
+	lockStarted := time.Now()
 	err = lockHistory(lockCtx, control, cfg)
+	observability.End(lockSpan, err)
 	cancelLock()
+	lockStatus := "acquired"
+	if errors.Is(err, errTargetBusy) {
+		lockStatus = "busy"
+	} else if err != nil {
+		lockStatus = "error"
+	}
+	slog.InfoContext(ctx, "worker.lock", "status", lockStatus, "wait_ms", float64(time.Since(lockStarted).Microseconds())/1000)
+	if err == nil {
+		defer slog.InfoContext(ctx, "worker.lock", "status", "released")
+	}
 	if err != nil {
 		if errors.Is(err, errTargetBusy) {
 			// Waiting for another migration does not consume the failure budget.
@@ -480,6 +523,7 @@ func (w *Worker) process(ctx context.Context, c claim) error {
 		}
 		c.job.AttemptID = &id
 		c.job.registrationHash = hash
+		slog.InfoContext(ctx, "migration.attempt.registered", "status", "RUNNING", "attempt_id", id)
 		return nil
 	}
 	var batch func(string, int64) error
