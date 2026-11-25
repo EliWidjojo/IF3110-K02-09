@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 
@@ -122,17 +123,18 @@ func (e *Engine) Run(ctx context.Context, id int, req MigrationRequest) (Executi
 		staleStatus = "NEEDS_REVIEW"
 	}
 	stale := "UPDATE " + table + " SET status='" + staleStatus + "',error_code='interrupted',capability_hash=NULL,finished_at=CURRENT_TIMESTAMP WHERE status='RUNNING'"
+	if !cfg.Driver.IsMySQL() {
+		stale += " AND NOT batch_scope_ready AND NOT EXISTS (SELECT 1 FROM platform_migrations.batch_checkpoints c WHERE c.attempt_id=attempts.id)"
+	}
 	if _, err = control.ExecContext(ctx, stale); err != nil {
 		return out, ErrUnsafeTarget
 	}
-	if cfg.Driver.IsMySQL() {
-		var unresolved int
-		if control.QueryRowContext(ctx, "SELECT count(*) FROM "+table+" WHERE status='NEEDS_REVIEW'").Scan(&unresolved) != nil {
-			return out, ErrUnsafeTarget
-		}
-		if unresolved > 0 {
-			return out, ErrNeedsReview
-		}
+	var unresolved int
+	if control.QueryRowContext(ctx, "SELECT count(*) FROM "+table+" WHERE status IN ('RUNNING','NEEDS_REVIEW')").Scan(&unresolved) != nil {
+		return out, ErrUnsafeTarget
+	}
+	if unresolved > 0 {
+		return out, ErrNeedsReview
 	}
 	legacySchema := "public"
 	if cfg.Driver.IsMySQL() {
@@ -153,6 +155,14 @@ func (e *Engine) Run(ctx context.Context, id int, req MigrationRequest) (Executi
 	if err = control.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM "+table+" WHERE status='SUCCESS'").Scan(&latest); err != nil {
 		return out, ErrUnsafeTarget
 	}
+	return executeLocked(ctx, target, control, cfg, user, req, statements, latest, nil, nil)
+}
+
+// executeLocked uses the caller's physical target lock through history and commit.
+func executeLocked(ctx context.Context, target *sql.DB, control *sql.Conn, cfg database.DatabaseConnection, user int, req MigrationRequest, statements []string, latest int, onRegister func(int64, string) error, batch func(string, int64) error) (ExecutionResult, error) {
+	var out ExecutionResult
+	var err error
+	table := cfg.Driver.Quote(HistorySchema(cfg.Driver, cfg.DatabaseName)) + ".attempts"
 	secret := make([]byte, 32)
 	if _, err = rand.Read(secret); err != nil {
 		return out, err
@@ -162,16 +172,39 @@ func (e *Engine) Run(ctx context.Context, id int, req MigrationRequest) (Executi
 	digest := sha256.Sum256([]byte(capability))
 	insert := "INSERT INTO " + table + "(version,executed_by,query_sql,status,capability_hash) VALUES(" + cfg.Driver.Bind(1) + "," + cfg.Driver.Bind(2) + "," + cfg.Driver.Bind(3) + ",'RUNNING'," + cfg.Driver.Bind(4) + ")"
 	var attemptID int64
+	// Publish the ID on the platform before the target can commit the attempt.
+	// A nonempty registration hash means execution has not been authorized yet.
+	reg, err := control.BeginTx(ctx, nil)
+	if err != nil {
+		return out, err
+	}
+	defer reg.Rollback()
 	if cfg.Driver.IsMySQL() {
-		result, x := control.ExecContext(ctx, insert, req.Version, user, req.QuerySQL, hex.EncodeToString(digest[:]))
+		result, x := reg.ExecContext(ctx, insert, req.Version, user, req.QuerySQL, hex.EncodeToString(digest[:]))
 		if x != nil {
 			return out, ErrUnsafeTarget
 		}
-		attemptID, _ = result.LastInsertId()
-	} else if err = control.QueryRowContext(ctx, insert+" RETURNING id", req.Version, user, req.QuerySQL, digest[:]).Scan(&attemptID); err != nil {
+		attemptID, err = result.LastInsertId()
+		if err != nil {
+			return out, err
+		}
+	} else if err = reg.QueryRowContext(ctx, insert+" RETURNING id", req.Version, user, req.QuerySQL, digest[:]).Scan(&attemptID); err != nil {
 		return out, ErrUnsafeTarget
 	}
 	out = ExecutionResult{AttemptID: attemptID, Version: req.Version, Status: "RUNNING", Atomic: !req.NonAtomicDDL}
+	if onRegister != nil {
+		if err = onRegister(attemptID, hex.EncodeToString(digest[:])); err != nil {
+			return out, err
+		}
+	}
+	if err = reg.Commit(); err != nil {
+		return out, ErrOutcomeUnknown
+	}
+	if onRegister != nil {
+		if err = onRegister(attemptID, ""); err != nil {
+			return out, err
+		}
+	}
 	fail := func(cause error, code string) (ExecutionResult, error) {
 		state := ""
 		var pe *pq.Error
@@ -202,13 +235,33 @@ func (e *Engine) Run(ctx context.Context, id int, req MigrationRequest) (Executi
 		if code == "version_conflict" {
 			return out, ErrVersionConflict
 		}
+		if status == "FAILED" && batch == nil && transientTransaction(cause) {
+			return out, errors.Join(ErrMigrationFailed, errTransientRollback)
+		}
 		return out, ErrMigrationFailed
 	}
 	if req.Version <= latest {
 		return fail(ErrVersionConflict, "version_conflict")
 	}
+	if batch != nil {
+		if err = batch(capability, attemptID); err != nil {
+			if errors.Is(err, ErrOutcomeUnknown) {
+				return out, err
+			}
+			if errors.Is(err, errPartial) {
+				_, markErr := control.ExecContext(ctx, "UPDATE "+table+" SET status='NEEDS_REVIEW',error_code='partial_batch',capability_hash=NULL,finished_at=CURRENT_TIMESTAMP WHERE id=$1 AND status='RUNNING'", attemptID)
+				if markErr != nil {
+					return out, ErrOutcomeUnknown
+				}
+				return out, err
+			}
+			return fail(err, "batch_failed")
+		}
+		out.Status = "SUCCESS"
+		return out, nil
+	}
 	if cfg.Driver.IsMySQL() {
-		return e.runMySQL(ctx, target, control, cfg, req, statements, capability, out, fail)
+		return runMySQL(ctx, target, control, cfg, req, statements, capability, out, fail)
 	}
 	tx, err := target.BeginTx(ctx, nil)
 	if err != nil {
@@ -281,22 +334,34 @@ func (e *Engine) History(ctx context.Context, id, limit, offset int) ([]Attempt,
 func lockHistory(ctx context.Context, c *sql.Conn, cfg database.DatabaseConnection) error {
 	if cfg.Driver.IsMySQL() {
 		var ok int
-		if err := c.QueryRowContext(ctx, `SELECT GET_LOCK(?,10)`, HistorySchema(cfg.Driver, cfg.DatabaseName)).Scan(&ok); err != nil || ok != 1 {
-			return errors.New("migration sedang dikunci; coba kembali")
+		if err := c.QueryRowContext(ctx, `SELECT GET_LOCK(?,10)`, HistorySchema(cfg.Driver, cfg.DatabaseName)).Scan(&ok); err != nil {
+			return err
+		}
+		if ok != 1 {
+			return errTargetBusy
 		}
 		return nil
 	}
 	if _, err := c.ExecContext(ctx, `SELECT pg_advisory_lock(311009004)`); err != nil {
-		return errors.New("migration tidak dapat dikunci")
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return errTargetBusy
+		}
+		return err
 	}
 	return nil
 }
 func unlockHistory(c *sql.Conn, cfg database.DatabaseConnection) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	var err error
 	if cfg.Driver.IsMySQL() {
-		_, _ = c.ExecContext(ctx, `SELECT RELEASE_LOCK(?)`, HistorySchema(cfg.Driver, cfg.DatabaseName))
+		_, err = c.ExecContext(ctx, `SELECT RELEASE_LOCK(?)`, HistorySchema(cfg.Driver, cfg.DatabaseName))
 	} else {
-		_, _ = c.ExecContext(ctx, `SELECT pg_advisory_unlock(311009004)`)
+		_, err = c.ExecContext(ctx, `SELECT pg_advisory_unlock(311009004)`)
+	}
+	// Session locks disappear on disconnect. Never return a session whose
+	// unlock was not acknowledged to the connection pool.
+	if err != nil {
+		_ = c.Raw(func(any) error { return driver.ErrBadConn })
 	}
 }

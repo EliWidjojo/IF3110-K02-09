@@ -20,7 +20,6 @@ func NewHandler(engine *Engine, csrf admin.UserCSRFVerifier) *Handler { return &
 func RegisterRoutes(mux *http.ServeMux, h *Handler) {
 	// Existing endpoints
 	mux.HandleFunc("GET /api/databases/{database_id}/migrations/history", h.History)
-	mux.HandleFunc("POST /api/databases/{database_id}/migrations/execute", h.Execute)
 	mux.HandleFunc("POST /api/databases/{database_id}/migrations/diff", h.Diff)
 
 	// Workflow & Approval endpoints
@@ -251,6 +250,10 @@ func (h *Handler) Diff(w http.ResponseWriter, r *http.Request) {
 
 func writeError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrVersionConflict):
+		httpapi.WriteJSON(w, 409, nil, &httpapi.Error{Code: "version_conflict", Message: err.Error()})
+	case errors.Is(err, ErrMigrationFailed):
+		httpapi.WriteJSON(w, 422, nil, &httpapi.Error{Code: "migration_failed", Message: "Migration gagal. Lihat status dan SQLSTATE pada history; periksa SQL serta privilege target."})
 	case errors.Is(err, ErrNeedsReview) || errors.Is(err, ErrLegacyHistory):
 		httpapi.WriteJSON(w, 409, nil, &httpapi.Error{Code: "history_review_required", Message: err.Error()})
 	case errors.Is(err, ErrInvalidState) || errors.Is(err, ErrNotLatestVersion) || errors.Is(err, ErrCannotRollbackState):

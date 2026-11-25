@@ -4,6 +4,8 @@
 
 Atlas adalah platform administrasi database untuk mengelola koneksi, memberikan akses melalui group, menjelajahi schema dan data, serta menjalankan migration SQL dengan pencatatan riwayat. Backend Go menyajikan HTML, CSS bersama, dan vanilla JavaScript tanpa framework frontend.
 
+Persiapan demonstrasi: [panduan teknis auth, security, migration, query plan, dan pengujian](docs/PANDUAN_DEMO_AUTH_SECURITY.md), termasuk skenario manual, expected status, pemetaan automated test, dan latihan jawaban lisan. Gunakan juga [bank 50 pertanyaan dan skenario demo berdasarkan spesifikasi milestone](docs/BANK_PERTANYAAN_DEMO_MILESTONE_1.md) untuk latihan tanya jawab teknis.
+
 Database PostgreSQL internal menyimpan identitas, group, keanggotaan, grant, dan konfigurasi koneksi. Database target menyimpan data aplikasi serta history migration yang dilindungi privilege terpisah. Dukungan utama memakai PostgreSQL; MariaDB, analisis execution plan PostgreSQL, dan schema diff tersedia dengan batas yang dijelaskan di bawah.
 
 ## Daftar isi
@@ -383,6 +385,25 @@ Privilege database melindungi history meskipun SQL mencoba UPDATE, DELETE, DROP,
 
 SQL maksimum 12 KiB. Cakupan PostgreSQL adalah DDL schema/table/column/constraint/index/sequence/type/view yang didukung validator serta INSERT/UPDATE/DELETE. Kontrol transaksi, stored program, pengaturan session, dan administrasi role tidak disediakan melalui editor. Batas request 16 KiB, konteks migration 30 detik, statement timeout PostgreSQL 20 detik, lock timeout SQL 3 detik. Akun dan fungsi target tetap harus tepercaya; platform tidak menjanjikan sandbox untuk seluruh efek eksternal SQL.
 
+### Menjalankan migration melalui worker
+
+Jalankan `go run ./cmd/worker` pada proses terpisah dengan environment database internal dan kunci enkripsi yang sama seperti server. Untuk target PostgreSQL lama, jalankan kembali `cmd/target-setup` menggunakan akun pencatat agar tabel checkpoint dan fungsi pencatat batch tersedia.
+
+Editor mengirim ke `POST /api/databases/{database_id}/migrations/jobs`. Alias `/migrations/execute` memakai kontrak antrean yang sama. Keduanya memerlukan session, CSRF, izin edit, dan satu header `Idempotency-Key`. Simpan `id` serta `status_url` dari respons 202. Tetapkan anggota aktif sebagai leader melalui `PUT /api/admin/groups/{group_id}/leader` dengan body `{"user_id":2}`. Leader tiap grup dengan akses memberikan approval melalui `PUT /api/databases/{database_id}/migrations/jobs/{id}/approvals/{group_id}` sesudah membaca snapshot job. Dashboard memantau job yang diajukan. Detail mencantumkan attempt ID, status, error, dan jumlah batch serta row yang committed.
+
+Untuk migration biasa, kirim `version`, `query_sql`, dan opsional `down_sql`. Rollback mengacu ke job sukses terkini yang menyertakan SQL down. Kirim `{"operation":"rollback","source_job":12,"version":4}`. Forward mengacu ke job rollback yang sukses menggunakan `operation:"forward"`. Setiap operasi mendapat versi eksekusi baru dan approval sendiri.
+
+Contoh pengajuan batch PostgreSQL:
+
+```json
+{"version":1,"batch_size":10000,"query_sql":"UPDATE public.items SET processed = TRUE"}
+```
+
+Worker mendukung tabel biasa dengan primary key integer tunggal bernama `id` yang stabil dan assignment boolean `TRUE` atau `FALSE`. Ukuran batch 1 sampai 100.000 row. Sebelum UPDATE pertama, worker membaca seluruh ID dari satu snapshot dan menyimpan daftar ID per batch di `platform_migrations.batch_scope` pada target. Semua halaman dan penanda `batch_scope_ready` di-commit bersama, termasuk untuk cakupan kosong. Jalankan kembali `cmd/target-setup` pada target PostgreSQL yang sudah ada untuk memasang perubahan schema ini.
+
+
+Untuk mengulang pengukuran, gunakan cluster uji disposable, set `TEST_PLATFORM_DSN` serta `TEST_LARGE_BATCH=1`, lalu jalankan `go test ./internal/server -run TestLargeQueuedBatch -count=1 -v`. Pada pengujian lokal, UPDATE 250.000 row memerlukan 1,104 detik. Setelah transaksi baseline dibatalkan, job memproses dataset yang sama dalam 25 batch berukuran 10.000 dalam 1,490 detik dari pengajuan hingga hasil dibaca.
+
 ## Batas viewer dan representasi data
 
 Viewer menampilkan schema, table, column, constraint, index, dan data. Identifier divalidasi dan di-quote terpisah; nilai pagination memakai parameter SQL. Ukuran halaman 1–100 (default 50), hasil data maksimum 2 MiB, timeout operasi 5 detik. Primary key dipakai untuk urutan stabil; tanpa primary key, UI menjelaskan bahwa urutan tidak dijamin. Perubahan data bersamaan tetap dapat menggeser halaman berbasis offset.
@@ -564,6 +585,33 @@ scripts/                Generator environment dan init database
 config/                 Contoh konfigurasi koneksi
 screenshots/            Screenshot asli aplikasi untuk README
 ```
+
+File authentication, administrasi, dan viewer dikelompokkan berdasarkan fitur agar fungsi yang berkaitan dapat ditelusuri di satu tempat:
+
+| File | Isi |
+| --- | --- |
+| `internal/auth/auth.go` | Model dan repository identitas, bootstrap admin, login/logout, cookie, CSRF, serta middleware HTTP. |
+| `internal/auth/session.go` | Pembuatan, kedaluwarsa, rotasi, dan pencabutan session. |
+| `internal/auth/password.go` | Hashing dan verifikasi password. |
+| `internal/admin/user.go` | Model, service, validasi, dan repository user. |
+| `internal/admin/user_handler.go` | Endpoint HTTP administrasi user. |
+| `internal/admin/group.go` | Model, service, validasi, dan repository group beserta keanggotaannya. |
+| `internal/admin/group_handler.go` | Endpoint HTTP group dan keanggotaan. |
+| `internal/admin/authentication_repository.go` | Pembacaan identitas dan hash untuk authentication. |
+| `internal/access/grants.go` | Model, handler HTTP, service, dan repository izin group terhadap database. |
+| `internal/access/effective.go` | Model, service, dan repository perhitungan akses efektif pengguna. |
+| `internal/database/connection.go` | Model, service, dan repository konfigurasi serta kredensial koneksi. |
+| `internal/database/connection_handler.go` | Endpoint HTTP administrasi koneksi. |
+| `internal/database/connector.go` | Pembentukan koneksi target dan klasifikasi error yang aman. |
+| `internal/database/pool.go` | Siklus hidup, penggunaan ulang, dan invalidasi pool target. |
+| `internal/database/password_cipher.go` | Enkripsi dan dekripsi kredensial. |
+| `internal/database/database.go` | Dialect, konfigurasi legacy, dan penamaan schema history. |
+| `internal/database/statements.go` | Pemisahan statement SQL sesuai dialect. |
+| `internal/viewer/handler.go` | Seluruh endpoint viewer, respons metadata, pagination request, dan serialisasi data. |
+| `internal/viewer/service.go` | Pemeriksaan akses, timeout, dan koordinasi operasi viewer. |
+| `internal/viewer/metadata.go` | Model dan repository schema, tabel, kolom, constraint, serta index PostgreSQL. |
+| `internal/viewer/data.go` | Model, batas pagination, dan repository pembacaan data tabel PostgreSQL. |
+| `internal/viewer/mysql.go` | Implementasi pembacaan metadata dan data MariaDB/MySQL. |
 
 ## Identitas kelompok
 
