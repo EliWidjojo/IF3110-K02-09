@@ -71,6 +71,37 @@ describe("pemisahan halaman per role", () => {
     expect(screen.getByRole("link", { name: "Koneksi database" })).toBeTruthy();
   });
 
+  // Regresi: login sukses harus berpindah halaman tanpa refresh (dulu client.clear() memutus observer session).
+  it("login sukses langsung masuk ke halaman sesuai role", async () => {
+    let loggedIn = false;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+      if (url === "/api/auth/csrf") return json({ csrf_token: "t" });
+      if (url === "/api/auth/login") {
+        loggedIn = true;
+        return json({ data: { csrf_token: "t2" } });
+      }
+      if (url === "/api/platform/me") return loggedIn ? json({ data: { id: 2, username: "alice", is_active: true, is_platform_admin: false, leader_groups: [] } }) : json({ error: { message: "authentication required" } }, 401);
+      return json({ data: [] });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/login"]}>
+          <SessionProvider>
+            <App />
+          </SessionProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await screen.findByRole("heading", { name: "Masuk ke Database Platform" });
+    const form = container.querySelector("form")!;
+    (form.elements.namedItem("username") as HTMLInputElement).value = "alice";
+    (form.elements.namedItem("password") as HTMLInputElement).value = "rahasia-uji";
+    form.requestSubmit();
+    expect(await screen.findByText("Database viewer")).toBeTruthy();
+  });
+
   it("tanpa session diarahkan ke halaman login", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: { message: "authentication required" } }), { status: 401 })));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { Navigate, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { api, type Me } from "../api";
+import { api } from "../api";
 import { homeFor, useSession } from "../auth";
 import { Notice, Splash } from "../ui";
 
@@ -26,9 +26,10 @@ export function LoginPage() {
     setError("");
     try {
       await api.login(String(data.get("username") ?? "").trim(), String(data.get("password") ?? ""));
-      client.clear();
-      // Setelah identitas terbaca, render ulang mengarahkan ke halaman sesuai role.
-      await client.fetchQuery<Me | null>({ queryKey: ["me"], queryFn: ({ signal }) => api.me(signal) });
+      // Buang cache data user sebelumnya, lalu muat ulang identitas lewat observer SessionProvider;
+      // render ulang kemudian mengarahkan ke halaman sesuai role. (client.clear() akan memutus observer.)
+      client.removeQueries({ predicate: q => q.queryKey[0] !== "me" });
+      await client.refetchQueries({ queryKey: ["me"] });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Login gagal");
     } finally {

@@ -49,7 +49,8 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       try {
         await api.logout();
       } finally {
-        client.clear();
+        // Jangan client.clear(): observer identitas harus tetap menerima nilai null.
+        client.removeQueries({ predicate: q => q.queryKey[0] !== "me" });
         client.setQueryData(["me"], null);
       }
     },
