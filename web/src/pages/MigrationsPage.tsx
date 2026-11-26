@@ -55,10 +55,12 @@ function SubmitForm({ db, driver }: { db: number; driver: string }) {
   const history = useQuery({ queryKey: ["history", db, 0], queryFn: () => api.history(db, HISTORY_PAGE, 0) });
   const jobs = useQuery({ queryKey: ["jobs", db, "sources"], queryFn: () => api.jobs(db, 100, 0), enabled: operation !== "apply" });
   const nextVersion = (history.data?.latest_version ?? 0) + 1;
-  const sources = (jobs.data ?? []).filter(j =>
-    j.status === "SUCCESS" && !j.submission.batch_size &&
-    (operation === "rollback" ? j.submission.operation !== "rollback" && !!j.submission.down_sql : j.submission.operation === "rollback"),
-  );
+  // Rollback/forward hanya berlaku untuk eksekusi sukses terakhir (posisi aktif), sesuai aturan A → B → C.
+  const latest = (jobs.data ?? []).find(j => j.status === "SUCCESS");
+  const sources = latest && !latest.submission.batch_size &&
+    (operation === "rollback" ? latest.submission.operation !== "rollback" && !!latest.submission.down_sql : latest.submission.operation === "rollback")
+    ? [latest]
+    : [];
 
   const submit = useMutation({
     mutationFn: async () => {
@@ -141,7 +143,9 @@ function SubmitForm({ db, driver }: { db: number; driver: string }) {
           <label className="span-2">
             Job sumber
             <select required value={source} onChange={e => setSource(e.target.value)}>
-              <option value="">{jobs.isPending ? "Memuat job…" : sources.length ? "Pilih job" : "Tidak ada job yang memenuhi syarat"}</option>
+              <option value="">
+                {jobs.isPending ? "Memuat job…" : sources.length ? "Pilih job" : operation === "rollback" ? "Job sukses terakhir tidak memiliki SQL down" : "Job sukses terakhir bukan rollback"}
+              </option>
               {sources.map(j => (
                 <option key={j.id} value={j.id}>
                   Job #{j.id} · v{j.submission.version} · {j.submission.operation ?? "apply"} · {formatTime(j.finished_at)}
