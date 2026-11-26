@@ -441,6 +441,36 @@ Aktivitas administrasi (user, group, leader, grant, koneksi) tercatat melalui `h
 
 Rantai span: `POST /api/databases/{id}/migrations/jobs` → (trace context disimpan sebagai W3C `traceparent` di kolom `platform.migration_jobs.trace_context`) → `worker.process` → `worker.lock` → `migration.batch` → `db.exec`/`db.query`/`db.transaction`. Span worker adalah anak dari span API walaupun berjalan di proses lain. Durasi dicatat pada setiap span; error dicatat dengan `RecordError` dan status `Error`, termasuk `db.response.status_code` berisi SQLSTATE.
 
+### Contoh output
+
+Diambil dari run lokal 26 November 2026 (server + worker, PostgreSQL Compose). Job #2 adalah migration per batch 300.000 row; seluruh 374 baris log-nya, dari request API sampai 31 transaksi batch di worker, memiliki `trace_id` yang sama.
+
+Log batch di worker:
+
+```json
+{"time":"2026-11-26T16:05:16.0736064+07:00","level":"INFO","event":"migration.batch","service":"atlas-worker","status":"committed","rows":10000,"duration_ms":37.577,"sqlstate":"","worker_id":"worker-1","job_id":2,"database_id":1,"version":2,"operation":"apply","batch_size":10000,"recovery_count":0,"attempt_id":2,"batch":1,"batch_attempt":1,"batch_rows":10000,"trace_id":"584f9c9965699dce918c70654000114b","span_id":"54ad871b9f4da08a"}
+```
+
+Kegagalan SQL dengan SQLSTATE:
+
+```json
+{"time":"2026-11-26T16:07:04.2664772+07:00","level":"ERROR","event":"sql.finish","service":"atlas-worker","db_system":"postgresql","db_role":"target","query":"INSERT INTO public.b VALUES ('bukan angka')","params":null,"status":"error","duration_ms":0.498,"sqlstate":"22P02","error":"invalid input syntax for type integer: \"bukan angka\"","worker_id":"worker-1","job_id":6,"database_id":1,"version":6,"operation":"apply","batch_size":0,"recovery_count":0,"trace_id":"93c59c4955403d1d85a8571a7e0d7bc9","span_id":"078313aad4e88504"}
+```
+
+Query read-only viewer (parameter angka tampil, actor dan database berkorelasi):
+
+```json
+{"time":"2026-11-26T16:03:47.0468966+07:00","level":"INFO","event":"sql.finish","service":"atlas-server","db_system":"postgresql","db_role":"target","query":"SELECT id,version,executed_by,executed_at,finished_at,status,query_sql,sql_state,error_code FROM \"platform_migrations\".attempts ORDER BY id DESC LIMIT $1 OFFSET $2","params":["25","0"],"status":"success","duration_ms":4.999,"rows":0,"request_id":"b3e5ed6f5f4069b9","database_id":1,"actor":3,"trace_id":"d9d7e180dbb7aeb6c79088875e943147","span_id":"e70964b510352c9a"}
+```
+
+Span worker (dipotong) yang parent-nya adalah span API `POST /api/databases/{id}/migrations/jobs` dari proses server (`Remote: true`):
+
+```json
+{"Name":"worker.process","SpanContext":{"TraceID":"4c0a3e851dd7a470390ed631a0620f9d","SpanID":"96289616c720ed68"},"Parent":{"TraceID":"4c0a3e851dd7a470390ed631a0620f9d","SpanID":"f8a77736c835a80c","Remote":true},"StartTime":"2026-11-26T16:04:43.6315213+07:00","EndTime":"2026-11-26T16:04:44.6561338+07:00","Attributes":[{"Key":"worker_id","Value":{"Type":"STRING","Value":"worker-1"}},{"Key":"job_id","Value":{"Type":"INT64","Value":1}},{"Key":"database_id","Value":{"Type":"INT64","Value":1}}],"Status":{"Code":"Unset"}}
+```
+
+Pada Windows PowerShell 5.1, redirect `2>` membungkus setiap baris stderr sebagai error PowerShell; untuk menyimpan span apa adanya, jalankan dari Git Bash atau `cmd /c "worker.exe 2> worker.spans.jsonl"`.
+
 ### Penyamaran data sensitif
 
 - Atribut yang namanya mengandung `password`, `secret`, `token`, `cookie`, `csrf`, `session`, `dsn`, `credential`, `authorization`, atau `capability` diganti `[REDACTED]`.
