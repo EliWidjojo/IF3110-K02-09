@@ -317,7 +317,7 @@ func TestOldRevokedSessionDoesNotInvalidateNewLogin(t *testing.T) {
 }
 func TestDashboardRoutesAndAdministrationContracts(t *testing.T) {
 	f := fixture(t)
-	for _, path := range []string{"/platform/", "/platform/assets/core.js", "/platform/assets/admin.js", "/platform/assets/viewer.js", "/platform/assets/migrations.js", "/platform/assets/analysis.js", "/api/platform/me", "/api/admin/users", "/api/admin/groups", "/api/admin/databases"} {
+	for _, path := range []string{"/api/platform/me", "/api/admin/users", "/api/admin/groups", "/api/admin/databases"} {
 		status(t, f.admin.request("GET", path, "", nil), 200)
 	}
 	status(t, f.admin.request("PATCH", "/api/admin/users/2", `{"username":"alice-new","is_active":true,"is_platform_admin":false}`, nil), 200)

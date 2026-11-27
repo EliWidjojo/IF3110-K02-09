@@ -24,10 +24,28 @@ func NewGroupHandler(service *GroupService, csrf UserCSRFVerifier) *GroupHandler
 
 func RegisterGroupRoutes(mux *http.ServeMux, handler *GroupHandler) {
 	mux.HandleFunc("PUT /api/admin/groups/{id}/leader", handler.HandleSetLeader)
+	mux.HandleFunc("GET /api/admin/groups/{id}/leader", handler.HandleGetLeader)
 	mux.HandleFunc("/api/admin/groups", handler.HandleGroups)
 	mux.HandleFunc("/api/admin/groups/{id}", handler.HandleGroup)
 	mux.HandleFunc("/api/admin/groups/{id}/members", handler.HandleGroupMembers)
 	mux.HandleFunc("/api/admin/groups/{id}/members/{user_id}", handler.HandleGroupMember)
+}
+
+func (h *GroupHandler) HandleGetLeader(w http.ResponseWriter, r *http.Request) {
+	if !h.prepareRequest(w, r, false) {
+		return
+	}
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		WriteGroupServiceError(w, ErrInvalidGroupInput)
+		return
+	}
+	leader, err := h.service.Leader(r.Context(), id)
+	if err != nil {
+		WriteGroupServiceError(w, err)
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, map[string]*int{"user_id": leader}, nil)
 }
 
 func (h *GroupHandler) HandleSetLeader(w http.ResponseWriter, r *http.Request) {
