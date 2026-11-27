@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"IF3110-K02-09/internal/access"
 	"IF3110-K02-09/internal/admin"
 	"IF3110-K02-09/internal/httpapi"
+	"IF3110-K02-09/internal/observability"
 )
 
 // Model identitas internal.
@@ -226,7 +228,7 @@ func (h *HTTP) Require(next http.Handler) http.Handler {
 		if current != token {
 			h.cookie(w, current, session)
 		}
-		next.ServeHTTP(w, r.WithContext(access.WithPrincipal(r.Context(), p)))
+		next.ServeHTTP(w, r.WithContext(observability.SetActor(access.WithPrincipal(r.Context(), p), p.ID)))
 	})
 }
 func (h *HTTP) RequireAdmin(next http.Handler) http.Handler {
@@ -303,6 +305,7 @@ func (h *HTTP) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.allowLogin(r) {
+		slog.WarnContext(r.Context(), "auth.login", "status", "rate_limited")
 		w.Header().Set("Retry-After", "60")
 		Error(w, 429, "too many login attempts")
 		return
@@ -321,6 +324,8 @@ func (h *HTTP) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	valid := VerifyPassword(hash, req.Password)
 	if !valid || !found || u.Disabled {
+		// Username dicatat untuk audit; password tidak pernah masuk log.
+		slog.WarnContext(r.Context(), "auth.login", "status", "failed", "username", strings.TrimSpace(req.Username))
 		Error(w, 401, "invalid username or password")
 		return
 	}
@@ -336,11 +341,13 @@ func (h *HTTP) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.cookie(w, token, p)
+	slog.InfoContext(observability.SetActor(r.Context(), latest.ID), "auth.login", "status", "success", "username", latest.Username, "platform_admin", principal.Admin)
 	JSON(w, 200, map[string]any{"user": principal, "csrf_token": p.CSRF})
 }
 func (h *HTTP) Logout(w http.ResponseWriter, r *http.Request) {
 	h.Sessions.Revoke(h.token(r))
 	h.clearCookie(w)
+	slog.InfoContext(r.Context(), "auth.logout", "status", "success")
 	w.WriteHeader(http.StatusNoContent)
 }
 

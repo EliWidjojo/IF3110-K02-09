@@ -106,6 +106,8 @@ CREATE TABLE IF NOT EXISTS platform.migration_jobs (
 CREATE INDEX IF NOT EXISTS migration_jobs_database_created ON platform.migration_jobs(database_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS migration_jobs_worker_status ON platform.migration_jobs(worker_id, status, id);
 CREATE INDEX IF NOT EXISTS migration_jobs_queued ON platform.migration_jobs(id) WHERE status='QUEUED';
+-- W3C traceparent dari request pengaju; dibaca worker untuk menyambung trace API -> queue -> worker.
+ALTER TABLE platform.migration_jobs ADD COLUMN IF NOT EXISTS trace_context TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE platform.database_connections ADD COLUMN IF NOT EXISTS target_version BIGINT NOT NULL DEFAULT 1;
 CREATE OR REPLACE FUNCTION platform.track_target_change() RETURNS trigger LANGUAGE plpgsql AS $$

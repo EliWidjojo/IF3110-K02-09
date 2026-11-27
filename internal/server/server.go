@@ -3,6 +3,7 @@ package server
 import (
 	"IF3110-K02-09/internal/auth"
 	"IF3110-K02-09/internal/httpapi"
+	"IF3110-K02-09/internal/observability"
 	"IF3110-K02-09/internal/platform"
 	"IF3110-K02-09/web"
 	"bytes"
