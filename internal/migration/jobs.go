@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"IF3110-K02-09/internal/admin"
 	"IF3110-K02-09/internal/database"
 	"IF3110-K02-09/internal/httpapi"
+	"IF3110-K02-09/internal/observability"
 )
 
 // QUEUED menyimpan snapshot sambil menunggu persetujuan dan klaim worker.
@@ -196,10 +198,12 @@ func scanJob(row interface{ Scan(...any) error }) (Job, error) {
 
 func (s *JobService) createJob(ctx context.Context, databaseID, actor int, key string, req JobSubmission, driver database.Dialect) (Job, error) {
 	j, err := scanJob(s.db.QueryRowContext(ctx, `INSERT INTO platform.migration_jobs
-		(database_id, submitted_by, idempotency_key, version, query_sql, non_atomic_ddl, driver, batch_size,down_sql,operation,source_job)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		(database_id, submitted_by, idempotency_key, version, query_sql, non_atomic_ddl, driver, batch_size,down_sql,operation,source_job,trace_context)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		ON CONFLICT (database_id, submitted_by, idempotency_key) DO NOTHING
-		RETURNING `+jobColumns, databaseID, actor, key, req.Version, req.QuerySQL, req.NonAtomicDDL, driver, req.BatchSize, req.DownSQL, req.Operation, req.SourceJob))
+		RETURNING `+jobColumns, databaseID, actor, key, req.Version, req.QuerySQL, req.NonAtomicDDL, driver, req.BatchSize, req.DownSQL, req.Operation, req.SourceJob,
+		// Trace context API ikut disimpan agar span worker tersambung ke request pengaju.
+		observability.InjectTrace(ctx)))
 	if errors.Is(err, sql.ErrNoRows) {
 		// Statement terpisah memperoleh snapshot baru setelah INSERT paralel selesai.
 		// Tidak memakai DO UPDATE agar retry tidak mengubah job/status/timestamp lama.
@@ -374,6 +378,7 @@ func (h *JobHandler) handleRecovery(w http.ResponseWriter, r *http.Request) {
 		writeJobError(w, err)
 		return
 	}
+	slog.InfoContext(ctx, "migration.job.recovery_request", "status", string(j.Status), "job_id", jobID)
 	w.Header().Set("Location", j.StatusURL)
 	httpapi.WriteJSON(w, http.StatusAccepted, j, nil)
 }
@@ -395,10 +400,16 @@ func (h *JobHandler) handleBatchAction(w http.ResponseWriter, r *http.Request, c
 		return
 	}
 	j, err := h.service.queueBatchAction(r.Context(), dbID, jobID, number, cancelBatch)
+	event := "migration.batch.retry_request"
+	if cancelBatch {
+		event = "migration.batch.cancel_request"
+	}
 	if err != nil {
+		slog.WarnContext(r.Context(), event, "status", "rejected", "job_id", jobID, "request_number", number, "error", err.Error())
 		writeJobError(w, err)
 		return
 	}
+	slog.InfoContext(r.Context(), event, "status", string(j.Status), "job_id", jobID, "request_number", number)
 	w.Header().Set("Location", j.StatusURL)
 	httpapi.WriteJSON(w, http.StatusAccepted, j, nil)
 }
@@ -444,9 +455,11 @@ func (h *JobHandler) HandleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !allowed {
+		slog.WarnContext(ctx, "migration.job.approve", "status", "denied", "job_id", job, "group_id", group)
 		writeJobError(w, access.ErrDatabaseAccessDenied)
 		return
 	}
+	slog.InfoContext(ctx, "migration.job.approve", "status", "approved", "job_id", job, "group_id", group, "retry_count", round)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -485,9 +498,12 @@ func (h *JobHandler) HandleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	j, err := h.service.SubmitJob(r.Context(), databaseID, r.Header.Get("Idempotency-Key"), req.JobSubmission)
 	if err != nil {
+		slog.WarnContext(r.Context(), "migration.job.submit", "status", "rejected", "error", err.Error())
 		writeJobError(w, err)
 		return
 	}
+	slog.InfoContext(r.Context(), "migration.job.submit", "status", "queued", "job_id", j.ID, "version", j.Submission.Version,
+		"operation", j.Submission.Operation, "source_job", j.Submission.SourceJob, "batch_size", j.Submission.BatchSize)
 	w.Header().Set("Location", j.StatusURL)
 	httpapi.WriteJSON(w, http.StatusAccepted, j, nil)
 }

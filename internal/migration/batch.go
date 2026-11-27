@@ -7,10 +7,12 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
 
+	"IF3110-K02-09/internal/observability"
 	"github.com/lib/pq"
 )
 
@@ -208,7 +210,20 @@ func (w *Worker) runBatch(ctx context.Context, c claim, target *sql.DB, audit *s
 			return err
 		}
 		for retries := 0; ; retries++ {
-			err = commitBatchPage(ctx, conn, token, batches+1, update, keys, c.job.Submission)
+			// Satu span dan satu log hasil per transaksi batch; retry sementara tercatat sebagai attempt berikutnya.
+			bctx, span := observability.Start(ctx, "migration.batch", "attempt_id", id, "batch", batches+1, "batch_attempt", retries+1, "batch_rows", len(keys))
+			started := time.Now()
+			err = commitBatchPage(bctx, conn, token, batches+1, update, keys, c.job.Submission)
+			observability.End(span, err)
+			level, status := slog.LevelInfo, "committed"
+			if last {
+				status = "completed" // halaman kosong terakhir hanya menandai attempt selesai
+			}
+			if err != nil {
+				level, status = slog.LevelWarn, "rolled_back"
+			}
+			slog.Log(bctx, level, "migration.batch", "status", status, "rows", len(keys),
+				"duration_ms", float64(time.Since(started).Microseconds())/1000, "sqlstate", observability.SQLState(err))
 			if err == nil {
 				break
 			}

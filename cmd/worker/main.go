@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,8 +13,9 @@ import (
 
 	"IF3110-K02-09/internal/database"
 	"IF3110-K02-09/internal/migration"
+	"IF3110-K02-09/internal/observability"
 	"IF3110-K02-09/internal/platform"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 func run(ctx context.Context) error {
@@ -22,10 +23,11 @@ func run(ctx context.Context) error {
 	if dsn == "" || os.Getenv("PQGO_DEBUG") == "1" {
 		return errors.New("konfigurasi database internal tidak valid")
 	}
-	db, err := sql.Open("postgres", dsn)
+	connector, err := pq.NewConnector(dsn)
 	if err != nil {
 		return errors.New("database internal tidak tersedia")
 	}
+	db := sql.OpenDB(observability.WrapConnector(connector, observability.DB{System: "postgresql", Role: "platform"}))
 	defer db.Close()
 	db.SetMaxOpenConns(8)
 	start, done := context.WithTimeout(ctx, 20*time.Second)
@@ -47,13 +49,14 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	slog.Info("worker.started", "worker_id", name)
 	for ctx.Err() == nil {
 		worked, err := w.ProcessNext(ctx)
 		if worked && err == nil {
 			continue
 		}
 		if err != nil && ctx.Err() == nil {
-			log.Print("pemeriksaan job terhenti; worker akan mencoba kembali")
+			slog.Warn("worker.poll", "worker_id", name, "status", "error", "error", err.Error())
 		}
 		select {
 		case <-ctx.Done():
@@ -65,9 +68,20 @@ func run(ctx context.Context) error {
 }
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if err := run(ctx); err != nil {
-		log.Fatal(err)
+	shutdown, err := observability.Setup("atlas-worker")
+	if err != nil {
+		slog.Error("worker.stopped", "status", "error", "error", err.Error())
+		os.Exit(1)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err = run(ctx)
+	stop()
+	flush, done := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = shutdown(flush)
+	done()
+	if err != nil {
+		slog.Error("worker.stopped", "status", "error", "error", err.Error())
+		os.Exit(1)
+	}
+	slog.Info("worker.stopped", "status", "success")
 }

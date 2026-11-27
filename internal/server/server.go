@@ -4,6 +4,7 @@ import (
 	"IF3110-K02-09/internal/auth"
 	"IF3110-K02-09/internal/dashboard"
 	"IF3110-K02-09/internal/httpapi"
+	"IF3110-K02-09/internal/observability"
 	"IF3110-K02-09/internal/platform"
 	"net/http"
 )
@@ -23,5 +24,6 @@ func New(a *auth.HTTP, module *platform.PlatformModule) http.Handler {
 	dashboard.RegisterDashboardRoutes(mux)
 	mux.HandleFunc("GET /{$}", loginPage)
 	mux.HandleFunc("GET /auth.js", loginScript)
-	return auth.Headers(mux)
+	// Span dan log http.request membungkus seluruh API, termasuk request yang ditolak auth.
+	return auth.Headers(observability.HTTP(mux))
 }
